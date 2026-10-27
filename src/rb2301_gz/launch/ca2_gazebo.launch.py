@@ -5,7 +5,7 @@ from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 from launch.actions import SetEnvironmentVariable
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, TextSubstitution, Command, PythonExpression
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, TextSubstitution, Command
 
 def generate_launch_description():
     ld = LaunchDescription()
@@ -42,13 +42,6 @@ def generate_launch_description():
     ])
     ld.add_action(arg_world)
 
-    arg_headless = DeclareLaunchArgument(
-        'headless',
-        default_value='false',
-        description='Run only the Gazebo server without opening the GUI'
-    )
-    ld.add_action(arg_headless)
-
     # publishes the robot states into robot_description topic, along with transforms.
     robot_state_publisher_node = Node(
         package='robot_state_publisher',
@@ -83,13 +76,8 @@ def generate_launch_description():
             'gz_args': [
                 path_world,
                 TextSubstitution(text=' -r -v -v1'), # for non-VBox users
-                PythonExpression([
-                    "' -s' if '", LaunchConfiguration('headless'),
-                    "'.lower() == 'true' else ''"
-                ]),
                 # TextSubstitution(text=' -r -v -v1 --render-engine ogre'), # DO NOT USE: this may cause the last reading for VBox users to become 0.05. -r for autorun, -v for verbose, v1 for level 1 verbose.
-            ],
-            'on_exit_shutdown': 'true',
+            ], 
         }.items()
     )
     ld.add_action(launch_gz_sim)
@@ -126,13 +114,13 @@ def generate_launch_description():
         package="ros_gz_bridge",
         executable="parameter_bridge",
         arguments=[
-            "/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock",
-            "/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist",
-            "/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry",
-            "/joint_states@sensor_msgs/msg/JointState[gz.msgs.Model",
-            "/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V",
-            "/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan",
-            "/imu@sensor_msgs/msg/Imu[gz.msgs.IMU",
+            "/clock@rosgraph_msgs/msg/Clockgz.msgs.Clock",
+            "/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist",
+            "/odom@nav_msgs/msg/Odometry@gz.msgs.Odometry",
+            "/joint_states@sensor_msgs/msg/JointState@gz.msgs.Model",
+            "/tf@tf2_msgs/msg/TFMessage@gz.msgs.Pose_V",
+            "/scan@sensor_msgs/msg/LaserScan@gz.msgs.LaserScan",
+            "/imu@sensor_msgs/msg/Imu@gz.msgs.IMU",
             # "/world/empty/dynamic_pose/info@tf2_msgs/msg/TFMessage@gz.msgs.Pose_V", # This topic publishes ground-truth pose of the gz sim actors. No need since we have odom
         ],
         output="screen",
@@ -152,3 +140,5 @@ def generate_launch_description():
     # ld.add_action(node_rviz)
 
     return ld
+
+

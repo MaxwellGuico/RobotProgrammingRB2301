@@ -454,8 +454,6 @@ class WaypointNode(Node):
         openList = [start_node] # List of SearchNode
         closedList = [] # List of SearchNode
 
-        
-
         grid_size_x = self.map_array.shape[0]
         grid_size_y = self.map_array.shape[1]
 
