@@ -216,10 +216,12 @@ class ObstacleCourseNode(Node):
             "motion_confirmation_wait": 24.0, # stopped observation before abandoning a motion hint
             "motion_minimum_span": 0.30, # metres of repeatedly changing returns
             "crossing_speed": 0.30, # simulation only; hardware remains disabled
-            "crossing_acceleration": 0.40, # simulation crossing ramp; measure on hardware
+            "crossing_acceleration": 0.80, # simulation crossing ramp; measure on hardware
             "crossing_padding": 0.05, # allowance beyond observed moving returns
             "crossing_time_margin": 0.25, # seconds beyond reaction/acceleration time
             "crossing_observed_windows": 2,
+            "crossing_observation_timeout": 35.0, # bounded time to learn a usable interval
+            "crossing_maximum_approaches": 2, # try another observed staging line, then report failure
             "completion_required_bands": 2,
             "completion_wall_distance": 0.65, # metres from pose origin to front wall
             "completion_minimum_wall_span": 0.20,
@@ -254,7 +256,7 @@ class ObstacleCourseNode(Node):
         self.motion_done = False
         # Explicit simulation-only test selection; hardware always starts stopped.
         self.test_primitive = os.environ.get('RB2301_TEST_PRIMITIVE', 'stopped') if self.is_simulation else 'stopped'
-        if self.test_primitive not in ('stopped', 'forward', 'backward', 'turn_left', 'turn_right', 'navigate'):
+        if self.test_primitive not in ('stopped', 'forward', 'backward', 'crossing_forward', 'turn_left', 'turn_right', 'navigate'):
             raise ValueError('Unknown RB2301_TEST_PRIMITIVE')
         self.nav_settings['debug_visuals'] = os.environ.get('RB2301_DEBUG_VISUALS', '1') != '0'
         self.active_stage = int(os.environ.get('RB2301_STAGE', '5'))
@@ -835,7 +837,13 @@ class ObstacleCourseNode(Node):
         p = self.nav_settings
         lookahead = p['look_ahead_distance']
         self.carrot = self.get_carrot(self.pose[:2], self.route, lookahead)
-        while self.carrot is not None and not self.segment_clear(self.pose[:2], self.carrot):
+        # The route is obstacle-padded; the carrot's sightline must be observed free.
+        # Body clearance is checked for the actual commanded turning/braking arc
+        # in safe_motion(). A turn-in-place then straight trip to the carrot can
+        # reject a feasible curved approach around a narrow corner.
+        while self.carrot is not None and any(
+                self.observation_grid.get(cell) != 0
+                for cell in self.ray_cells(self.world_cell(*self.pose[:2]),self.world_cell(*self.carrot))):
             lookahead /= 2
             if lookahead < 0.025:
                 self.previous_heading_error = self.previous_control_time = None
@@ -996,9 +1004,20 @@ class ObstacleCourseNode(Node):
                              clear_since=None,windows=[],was_clear=None)
                 self.motion_zones.append(match)
                 self.get_logger().info(f'MOVING_BAND_CONFIRMED: centre={centre.round(2)} span={np.ptp(along):.2f}m')
-            # Keep the initial direction fixed. Extend only the observed sweep bounds.
-            match['low'] = min(match.get('low',math.inf),float(np.min(cloud@match['axis'])))
-            match['high'] = max(match.get('high',-math.inf),float(np.max(cloud@match['axis'])))
+            match.setdefault('cells',set()).update(group)
+            cloud = np.array([self.cell_world(c) for c in match['cells']])
+            # Refine from all observed motion before an approach starts. Freeze the
+            # crossing frame while following it, so its goal and timing stay stable.
+            if match is not getattr(self,'crossing_zone',None) and not match['passed']:
+                _,vectors = np.linalg.eigh(np.cov(cloud.T))
+                axis = vectors[:,-1]
+                if np.dot(axis,match['axis']) < 0:
+                    axis = -axis
+                normal = np.array((axis[1],-axis[0]))
+                if np.dot(normal,match['normal']) < 0:
+                    normal = -normal
+                match['centre'],match['axis'],match['normal'] = cloud.mean(axis=0),axis,normal
+            match['low'],match['high'] = float(np.min(cloud@match['axis'])),float(np.max(cloud@match['axis']))
 
     def motion_target(self):
         '''Direction hint from sensor evidence; only confirmed bands can count as passed.'''
@@ -1022,6 +1041,8 @@ class ObstacleCourseNode(Node):
     def moving_obstacle_command(self, now):
         '''Approach outside the sweep, observe clear cycles, then cross straight.'''
         p = self.nav_settings
+        if getattr(self,'navigation_stalled',False):
+            return (0.0,0.0), 'NO_PROGRESS'
         if getattr(self, 'backtracking', False):
             return None
         zone = self.crossing_zone
@@ -1045,6 +1066,8 @@ class ObstacleCourseNode(Node):
             candidates = [c for c in self.free_cells
                           if stand_off <= np.dot(zone['centre']-self.cell_world(c),zone['normal']) <= stand_off+p['map_resolution']
                           and zone['low']-p['motion_minimum_span'] <= np.dot(self.cell_world(c),zone['axis']) <= zone['high']+p['motion_minimum_span']
+                          and all(abs(np.dot(self.cell_world(c),zone['axis'])-lateral) >= p['frontier_revisit_distance']
+                                  for lateral in zone.get('failed_laterals',[]))
                           and all(self.footprint_clearance(self.scan_points,*self.cell_world(c),angle) >= p['clearance_margin']+p['turn_drift_margin']
                                   for angle in np.linspace(yaw-math.pi/2,yaw+math.pi/2,19))]
             if not candidates:
@@ -1075,6 +1098,7 @@ class ObstacleCourseNode(Node):
             self.crossing_phase = 'OBSERVE'
             zone['clear_since'], zone['was_clear'], zone['windows'] = None, None, []
             zone['aligned_lateral'] = False
+            zone['observe_started'] = None
         normal = zone['normal']
         error = math.atan2(normal[1],normal[0])-math.radians(self.pose[2])
         error = math.atan2(math.sin(error),math.cos(error))
@@ -1104,6 +1128,7 @@ class ObstacleCourseNode(Node):
             # Turning can move the pose origin slightly. Time the actual crossing line.
             zone['lateral'] = float(np.dot(self.pose[:2],zone['axis']))
             zone['aligned_lateral'] = True
+            zone['observe_started'] = now
         if zone.get('window_stamp') != self.scan_stamp:
             zone['window_stamp'] = self.scan_stamp
             points = self.moving_band_points(zone)
@@ -1117,14 +1142,32 @@ class ObstacleCourseNode(Node):
                     self.get_logger().info(f'SWING_CLEAR_WINDOW: {duration:.2f}s observed')
                 zone['clear_since'] = None
             zone['was_clear'] = clear
+        required = remaining/p['crossing_speed']+p['crossing_speed']/(2*p['crossing_acceleration'])+p['reaction_delay']+p['crossing_time_margin']
         if len(zone['windows']) >= p['crossing_observed_windows'] and zone['clear_since'] is not None:
             available = min(zone['windows'][-p['crossing_observed_windows']:])-(self.scan_stamp-zone['clear_since'])
-            required = remaining/p['crossing_speed']+p['crossing_speed']/(2*p['crossing_acceleration'])+p['reaction_delay']+p['crossing_time_margin']
             if available >= required and not self.waiting_for_clearance:
                 self.crossing_phase = 'CROSS'
                 self.blocked_since = None
                 self.get_logger().info(f'SWING_CROSSING: window remaining={available:.2f}s required={required:.2f}s')
                 return (p['crossing_speed'],0.0), 'SWING_CROSSING'
+        insufficient = (len(zone['windows']) >= p['crossing_observed_windows']
+                        and max(zone['windows']) < required)
+        if zone.get('observe_started') is None:
+            zone['observe_started'] = now
+        timed_out = now-zone['observe_started'] >= p['crossing_observation_timeout']
+        if insufficient or timed_out:
+            zone.setdefault('failed_laterals',[]).append(zone['lateral'])
+            self.get_logger().warning(f'SWING_REPOSITION: observed windows {zone["windows"][-4:]}; required {required:.2f}s')
+            if len(zone['failed_laterals']) >= p['crossing_maximum_approaches']:
+                self.navigation_stalled = True
+                self.get_logger().error('NO_SAFE_CROSSING: approach attempts exhausted; course completion remains unconfirmed')
+                return (0.0,0.0), 'NO_PROGRESS'
+            self.crossing_zone,self.crossing_phase = None,None
+            self.discard_goal('learn another crossing line after insufficient clear intervals',now)
+            if not self.start_backtracking(now):
+                self.navigation_stalled = True
+                return (0.0,0.0), 'NO_PROGRESS'
+            return (0.0,0.0), 'SWING_RETREAT'
         return (0.0,0.0), 'SWING_OBSERVING'
 
     def terminal_walls(self, normal, axis):
@@ -1478,7 +1521,7 @@ class ObstacleCourseNode(Node):
             return np.zeros(2), 'BRAKE_WAIT'
         target = np.array((forward, turn))
         accelerating = np.abs(target) > np.abs(self.last_command)
-        acceleration = p['crossing_acceleration'] if getattr(self, 'crossing_phase', None) == 'CROSS' else p['linear_acceleration']
+        acceleration = p['crossing_acceleration'] if getattr(self, 'crossing_phase', None) == 'CROSS' or getattr(self,'test_primitive','stopped') == 'crossing_forward' else p['linear_acceleration']
         limits = np.where(accelerating, (acceleration, p['angular_acceleration']),
                           (p['linear_braking'], p['angular_braking']))
         command = self.last_command + np.clip(target-self.last_command, -limits*dt, limits*dt)
@@ -1491,12 +1534,15 @@ class ObstacleCourseNode(Node):
             return 0.0, 0.0
         if self.motion_start is None:
             self.motion_start = self.pose.copy()
-        if self.test_primitive in ('forward', 'backward'):
+        if self.test_primitive in ('forward', 'backward', 'crossing_forward'):
             remaining = p['forward_test_distance'] - np.linalg.norm(self.pose[:2]-self.motion_start[:2])
             self.motion_done = remaining <= p['position_tolerance']
             heading_error = math.radians(wrap_deg(self.motion_start[2]-self.pose[2]))
             direction = 1 if self.test_primitive == 'forward' else -1
-            return (0.0, 0.0) if self.motion_done else (direction*min(p['linear_speed'], remaining), float(np.clip(2*heading_error, -p['angular_speed'], p['angular_speed'])))
+            speed = p['linear_speed']
+            if self.test_primitive == 'crossing_forward':
+                direction,speed = 1,p['crossing_speed']
+            return (0.0, 0.0) if self.motion_done else (direction*min(speed, remaining), float(np.clip(2*heading_error, -p['angular_speed'], p['angular_speed'])))
         sign = 1 if self.test_primitive == 'turn_left' else -1
         error = wrap_deg(self.motion_start[2] + sign*p['turn_test_angle'] - self.pose[2])
         self.motion_done = abs(error) <= p['heading_tolerance']

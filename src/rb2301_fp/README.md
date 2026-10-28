@@ -45,6 +45,8 @@ The current staged implementation starts **stopped**. It checks sensors, builds 
 # Motion primitives: run one at a time, with Gazebo running.
 RB2301_STAGE=2 RB2301_TEST_PRIMITIVE=forward ./fp.sh
 RB2301_STAGE=2 RB2301_TEST_PRIMITIVE=backward ./fp.sh
+# Simulation-only crossing acceleration check (up to crossing_speed).
+RB2301_STAGE=2 RB2301_TEST_PRIMITIVE=crossing_forward ./fp.sh
 RB2301_STAGE=2 RB2301_TEST_PRIMITIVE=turn_left ./fp.sh
 RB2301_STAGE=2 RB2301_TEST_PRIMITIVE=turn_right ./fp.sh
 
@@ -125,7 +127,7 @@ Safety stops bypass ordinary command smoothing. A smaller acceleration limit mus
 | `prefer_motion_frontiers` | true | Stage 6+ first prefers reachable groups toward observed motion, then group size and route length. Disable to compare with largest-group exploration. |
 | `preferred_clearance` | 0.30 m | A* prefers more clearance up to this distance. Increase if routes hug obstacles; it does not change the largest-frontier selection rule. |
 | `planning_interval` | 2.0 s | Retry interval while stopped without a goal. Shorter values search more frequently. |
-| `look_ahead_distance` | 0.18 m | Larger carrots smooth tracking but cut corners more aggressively. Smaller values can produce slow, twitchy tracking. Shortcuts are collision checked. |
+| `look_ahead_distance` | 0.18 m | Larger carrots smooth tracking but cut corners more aggressively. Smaller values can produce slow, twitchy tracking. The A* route uses obstacle padding and carrot sightlines require observed free space; actual commands receive the full footprint braking check. |
 | `goal_tolerance` | 0.08 m | Distance within which a local approach can finish, provided the actual stopping position also has turning clearance and the drift allowance. Smaller values demand more precise stopping. |
 | `heading_gain` | 2.0 s⁻¹ | Increase for stronger heading correction; too high produces overshoot. Heading error is in radians. |
 | `heading_derivative_gain` | 0.05 | Damps changing heading error. Higher values can amplify localization noise; reduce if commands jerk. |
@@ -223,7 +225,7 @@ progress = max(previous_progress, s)
 carrot_distance_along_route = min(progress + lookahead, route_length)
 ```
 
-Progress can advance to the next adjacent segment when that segment is closer after rounding a corner. It cannot jump to a later branch. A fresh-scan footprint check rejects a carrot shortcut through an obstacle; the follower shortens lookahead or stops.
+Progress can advance to the next adjacent segment when that segment is closer after rounding a corner. It cannot jump to a later branch. A carrot sightline must stay in observed free grid cells; the follower shortens lookahead or stops if that fails. The full rectangular footprint is checked along the actual commanded turning/braking arc on every tick. The follower does not require a hypothetical turn-in-place followed by a straight trip to the entire carrot to be feasible.
 
 ### 5. Convert carrot error to movement
 
@@ -289,16 +291,18 @@ These values are current simulation candidates. Crossing is still being validate
 | `motion_confirmation_wait` | 24.0 s | Maximum observation pause after a local goal when motion evidence exists, and recency window for unconfirmed hints. Increase for slower swings; too large delays exploring another area. A confirmed reachable staging route takes priority immediately. |
 | `motion_minimum_span` | 0.30 m | Minimum extent of a repeatedly changing band. Increase to reject small artifacts; decrease only if measured moving objects have smaller sweeps. |
 | `crossing_speed` | 0.30 m/s | Used only during an aligned simulation crossing. Higher values reduce crossing time but need more braking space. Hardware remains stopped; its existing 0.30 m/s cap is preserved. |
-| `crossing_acceleration` | 0.40 m/s² | Crossing command ramp and time estimate. Increasing shortens the predicted crossing; physical acceleration must support that assumption. Other movement keeps `linear_acceleration`. |
+| `crossing_acceleration` | 0.80 m/s² | Crossing command ramp and time estimate. Increasing shortens the predicted crossing; physical acceleration must support that assumption. Other movement keeps `linear_acceleration`. |
 | `crossing_padding` | 0.05 m | Allowance for unseen thickness and uncertainty beyond observed moving returns. Increase for larger/thicker obstacles and sensing uncertainty. |
 | `crossing_time_margin` | 0.25 s | Extra time beyond the acceleration and reaction estimate. Increase for timing variation. If no observed interval is long enough, remain stopped. |
 | `crossing_observed_windows` | 2 complete intervals | Number of previously measured intervals required. More observations increase waiting and help reveal variable periods. |
+| `crossing_observation_timeout` | 35 s | Maximum time learning clear intervals at an aligned staging line. Smaller values recover sooner but can interrupt slow cycles; larger values tolerate more observation. Repeated intervals that are all too short trigger recovery sooner. |
+| `crossing_maximum_approaches` | 2 approaches | Maximum distinct failed crossing lines. More attempts explore additional staging positions; exhausting the limit reports `NO_PROGRESS` with completion unconfirmed. |
 
 A new static observation that invalidates an observation goal causes replanning from the current pose, with a cooldown on that goal region. It does not itself require reversing. A goal affected by a confirmed moving band remains stable during a temporary wait. A persistently blocked path or a genuine progress stall can trigger breadcrumb recovery. The direction of travel is chosen to avoid an unnecessary half-turn: it can follow the recorded trail forwards or backwards. Reverse travel uses the actual rear footprint and signed velocity.
 
 Moving bands are confirmed using range changes from nearly identical, settled viewpoints. For each changed ray, the nearer of the old and new returns represents the moving occluder rather than the wall behind it. Repeated changed cells are grouped; their principal direction describes the observed sweep. This uses scans and pose, not Gazebo obstacle coordinates.
 
-The robot approaches a stable staging point outside the observed sweep, aligns perpendicular to it, and measures clear/blocked transitions at its **actual** lateral position after turning. An occluded band is unknown. A single clear scan is insufficient. If the remaining travel until the whole rear clears the band is `L`, the conservative timing check is:
+The robot approaches a stable staging point outside the observed sweep, aligns perpendicular to it, and measures clear/blocked transitions at its **actual** lateral position after turning. An occluded band is unknown. A single clear scan is insufficient. Repeated insufficient windows or the observation timeout trigger breadcrumb retreat and another staging line; the previous lateral line is excluded. Exhausted attempts stop with an explicit failure instead of waiting indefinitely. If the remaining travel until the whole rear clears the band is `L`, the conservative timing check is:
 
 ```text
 required_time = L / crossing_speed
@@ -343,7 +347,7 @@ This explains why a continuous far corner can have widely separated hits. The co
 
 ### Verification status — 28 October 2026
 
-**Paused at the user’s request.** Layout 002 still oscillates/replans near the static-obstacle corner and has not completed. The last stopped pose was approximately `(2.19, -0.40, -49.9°)`, with `ROUTE_BLOCKED` reported. Evidence is saved in `/tmp/rb2301-layout002-goal-fix.json` and its `.log`; the layout remains unchanged. The controller and Gazebo were shut down, zero velocity was published, and the task terminals exited. Acceptance remains **0/5**. Do not restart testing until the user resumes.
+**Resumed on frozen Layout 002.** The previous run oscillated near `(2.19, -0.40)` and reported `ROUTE_BLOCKED`. Rechecking all URDF collision meshes measured a body of 0.21479 m × 0.19145 m; the configured 0.216 m × 0.192 m footprint remains unchanged. Recorded scans permit a straight passage with 0.096 m minimum clearance. The A* route stays obstacle-padded. Carrot sightlines must be observed free; the full-body turning/braking check runs in `safe_motion()` on every command. Applying the route padding to the carrot’s hypothetical straight chord also caused unnecessary stops, so that duplicate constraint was removed. This removes a conflicting full-straight-chord test; the recorded next braking arc had 0.115 m clearance. The live regression is in progress. Acceptance remains **0/5**.
 
 - Stage 1: projection/metadata, stopped commands, and live sensor interruption/recovery passed.
 - Stage 2: forward, backward, left/right turns and a controlled barrier wait/resume passed. The reverse trial travelled 0.435 m with a minimum scan clearance of 0.125 m.
