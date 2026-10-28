@@ -128,6 +128,8 @@ class ObstacleCourseNode(Node):
         heading = np.rad2deg(self.yaw_from_quaternion(msg.pose.orientation))
         self.raw_pose = np.array((x,y,heading))
         x, y, heading = optitrack_to_maze(x, y, heading, self.frame) # CA2 maze frame, see optitrack_variables.config
+        # Convert maze coordinates to ROS navigation coordinates
+        y = -y
         self.pose = np.array((x,y,heading))
         return self.pose
 
@@ -158,7 +160,6 @@ class ObstacleCourseNode(Node):
         '''Keep tuning in one place; initialize only after the calibration block.'''
         from collections import deque
         from time import monotonic
-        from tf2_ros import Buffer, TransformListener
 
         self.nav_settings = {
             "scan_timeout": 0.5, # seconds without a new, advancing scan
@@ -241,7 +242,9 @@ class ObstacleCourseNode(Node):
         self.last_status = -math.inf
         self.debug_publisher = None
         self.last_debug_time = -math.inf
-        self.laser_transform = None
+        # LiDAR mount relative to robot pose reference: x [m], y [m], yaw [rad].
+        # Measure these on the physical robot before enabling movement.
+        self.laser_transform = (0.0, 0.0, 0.0)
         self.laser_frame = None
         self.last_command = np.zeros(2) # forward m/s, yaw rad/s; lateral is always zero
         self.measured_motion = np.zeros(2)
@@ -255,7 +258,7 @@ class ObstacleCourseNode(Node):
         self.motion_start = None
         self.motion_done = False
         # Explicit simulation-only test selection; hardware always starts stopped.
-        self.test_primitive = os.environ.get('RB2301_TEST_PRIMITIVE', 'stopped') if self.is_simulation else 'stopped'
+        self.test_primitive = os.environ.get('RB2301_TEST_PRIMITIVE', 'stopped')
         if self.test_primitive not in ('stopped', 'forward', 'backward', 'crossing_forward', 'turn_left', 'turn_right', 'navigate'):
             raise ValueError('Unknown RB2301_TEST_PRIMITIVE')
         self.nav_settings['debug_visuals'] = os.environ.get('RB2301_DEBUG_VISUALS', '1') != '0'
@@ -307,8 +310,6 @@ class ObstacleCourseNode(Node):
         self.progress_mark = 0.0
         self.navigation_stalled = False
         self.stop_requested = False
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
         qos = QoSProfile(depth=5, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.full_scan_sub = self.create_subscription(LaserScan, 'scan', self.remember_scan, qos)
         if self.is_simulation:
@@ -404,17 +405,10 @@ class ObstacleCourseNode(Node):
         frame = msg.header.frame_id.lstrip('/')
         if not frame:
             return 'MISSING_SCAN_FRAME'
-        if self.laser_transform is None or frame != self.laser_frame:
-            from rclpy.time import Time
-            from tf2_ros import TransformException
-            try:
-                t = self.tf_buffer.lookup_transform('base_footprint', frame, Time()).transform
-            except TransformException:
-                return 'WAITING_FOR_LASER_TF'
-            self.laser_transform = (t.translation.x, t.translation.y,
-                                    float(self.yaw_from_quaternion(t.rotation)))
+        # No TF lookup: use the configured fixed LiDAR mounting transform.
+        if frame != self.laser_frame:
             self.laser_frame = frame
-            self.get_logger().info(f'LiDAR mount from TF: {self.laser_transform} (m, m, rad)')
+            self.get_logger().info(f'LiDAR mount (configured): {self.laser_transform} (m, m, rad); scan frame={frame}')
         stamp, pose = min(self.pose_history, key=lambda item: abs(item[0] - self.scan_stamp))
         if abs(stamp - self.scan_stamp) > self.nav_settings['pose_scan_tolerance']:
             return 'POSE_SCAN_TIME_MISMATCH'
@@ -433,9 +427,8 @@ class ObstacleCourseNode(Node):
             return
         self.last_debug_time = now
         from copy import deepcopy
-        from geometry_msgs.msg import Point, TransformStamped
+        from geometry_msgs.msg import Point
         from rclpy.duration import Duration
-        from tf2_msgs.msg import TFMessage
         from visualization_msgs.msg import Marker, MarkerArray
         display_lifetime = Duration(seconds=max(1.0,3*self.nav_settings['debug_interval'])).to_msg()
 
@@ -443,24 +436,9 @@ class ObstacleCourseNode(Node):
             self.debug_publisher = self.create_publisher(MarkerArray, '/fp_debug/markers', 2)
             self.debug_publisher.publish(MarkerArray(markers=[Marker(action=Marker.DELETEALL)]))
             self.debug_scan_publisher = self.create_publisher(LaserScan, '/fp_debug/scan', 2)
-            self.debug_tf = self.create_publisher(TFMessage, '/fp_debug/tf', 10)
         if self.sensor_ready:
-            # Dedicated diagnostic frames avoid changing the robot's existing TF.
-            world_robot, robot_laser = TransformStamped(), TransformStamped()
-            world_robot.header.stamp = robot_laser.header.stamp = self.get_clock().now().to_msg()
-            world_robot.header.frame_id, world_robot.child_frame_id = 'fp_world', 'fp_robot'
-            robot_laser.header.frame_id, robot_laser.child_frame_id = 'fp_robot', 'fp_lidar'
-            world_robot.transform.translation.x = float(self.scan_pose[0])
-            world_robot.transform.translation.y = float(self.scan_pose[1])
-            yaw = math.radians(self.scan_pose[2])
-            world_robot.transform.rotation.z, world_robot.transform.rotation.w = math.sin(yaw/2), math.cos(yaw/2)
-            robot_laser.transform.translation.x, robot_laser.transform.translation.y = self.laser_transform[:2]
-            robot_laser.transform.rotation.z = math.sin(self.laser_transform[2]/2)
-            robot_laser.transform.rotation.w = math.cos(self.laser_transform[2]/2)
-            self.debug_tf.publish(TFMessage(transforms=[world_robot, robot_laser]))
+            # Publish scan in its original frame; no synthetic TF frames are created.
             scan = deepcopy(self.scan_msg)
-            scan.header.frame_id = 'fp_lidar'
-            scan.header.stamp = world_robot.header.stamp
             self.debug_scan_publisher.publish(scan)
         markers = MarkerArray()
         for number, kind in enumerate((Marker.POINTS, Marker.ARROW, Marker.TEXT_VIEW_FACING, Marker.LINE_STRIP)):

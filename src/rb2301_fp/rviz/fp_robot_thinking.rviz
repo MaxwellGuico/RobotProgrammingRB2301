@@ -1,0 +1,78 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Robot Memory1
+        - /Robot Perception and Planning1
+      Splitter Ratio: 0.55
+    Tree Height: 650
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Reference Grid
+      Enabled: true
+      Cell Size: 0.5
+      Plane: XY
+      Plane Cell Count: 20
+      Color: 130; 130; 130
+      Alpha: 0.25
+      Line Style:
+        Value: Lines
+        Line Width: 0.03
+      Reference Frame: <Fixed Frame>
+    - Class: rviz_default_plugins/Map
+      Name: Robot Memory
+      Enabled: true
+      Topic:
+        Value: /fp_debug/map
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Alpha: 0.7
+      Color Scheme: map
+      Draw Behind: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Robot Perception and Planning
+      Enabled: true
+      Marker Topic:
+        Value: /fp_debug/markers
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 10
+      Namespaces:
+        sensors: true
+        planning: true
+        carrot: true
+        breadcrumbs: true
+        motion_preference: true
+        observed_motion: true
+  Enabled: true
+  Global Options:
+    Background Color: 35; 39; 46
+    Fixed Frame: fp_world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Top Down
+      Angle: 0
+      Scale: 45
+      Target Frame: <Fixed Frame>
+      X: 0
+      Y: 0
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1400
