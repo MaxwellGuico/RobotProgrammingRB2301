@@ -11,7 +11,8 @@ import sys, os
 sys.path.insert(2, os.path.dirname(os.path.realpath(__file__))[:-16]+'rb2301_fp/rb2301_fp')
 print(os.path.realpath(__file__)[:-27], os.path.dirname(os.path.realpath(__file__))[:-16]+'rb2301_fp/rb2301_fp')
 from obstacle_modifier import modify_sdf_file
-modify_sdf_file()
+if os.environ.get("RB2301_RANDOMIZE", "1") != "0":
+    modify_sdf_file()
 
 
 def generate_launch_description():

@@ -1,12 +1,13 @@
-#!/bin/bash
-
-# Source ROS 2 Jazzy
-source /opt/ros/jazzy/setup.bash
-
-# Project-specific ROS settings
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_DOMAIN_ID=5
-export ROS_LOCALHOST_ONLY=0
-
-# Launch RViz with the project configuration
-rviz2 -d /home/maxwell-guico/rb2301/src/rb2301_fp/rviz/fp_robot_thinking.rviz
+#!/usr/bin/env bash
+set -e
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if ! command -v rviz2 >/dev/null 2>&1; then
+    for distro in "${ROS_DISTRO:-foxy}" foxy jazzy; do
+        if [[ -f "/opt/ros/$distro/setup.bash" ]]; then
+            source "/opt/ros/$distro/setup.bash"
+            break
+        fi
+    done
+fi
+# Keep the caller's ROS_DOMAIN_ID and RMW settings; do not force a robot number.
+exec rviz2 -d "$script_dir/rviz/fp_robot_thinking.rviz" "$@"
