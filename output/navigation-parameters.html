@@ -1,0 +1,115 @@
+<div id="nav-params">
+  <style>
+    #nav-params { color:var(--foreground); }
+    #nav-params .section { margin-bottom:24px; }
+    #nav-params .drawing { width:100%; display:block; overflow:visible; }
+    #nav-params .drawing text { fill:var(--foreground); font-size:12px; }
+    #nav-params .drawing .structure { stroke:var(--border); fill:none; }
+    #nav-params .drawing .dimension { stroke:var(--foreground); fill:none; }
+    #nav-params .drawing .footprint { stroke:var(--viz-series-1); fill:var(--viz-series-1); fill-opacity:.10; stroke-width:2; }
+    #nav-params .drawing .sweep { fill:var(--viz-series-1); fill-opacity:.13; }
+    #nav-params .drawing .obstacle { fill:var(--viz-series-2); }
+    #nav-params .trials { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
+    #nav-params .trial-content { display:flex; flex-direction:column; align-items:center; gap:2px; }
+    #nav-params .extent { display:flex; flex-wrap:wrap; justify-content:center; gap:8px 24px; }
+    #nav-params .status { margin-top:12px; }
+    @media(max-width:440px) { #nav-params .trials { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  </style>
+  <section class="section" aria-labelledby="nav-footprint-heading">
+    <h3 id="nav-footprint-heading">Clearance circle · top view</h3>
+    <div class="viz-controls">
+      <label class="form-label">Radius <span class="tabular-nums" data-radius-label>0.15 m</span>
+        <input class="form-range" data-radius type="range" min="0.10" max="0.25" step="0.01" value="0.15" aria-label="Clearance radius in metres">
+      </label>
+      <label class="form-label">Centre forward <span class="tabular-nums" data-offset-label>0.07 m</span>
+        <input class="form-range" data-offset type="range" min="0" max="0.15" step="0.01" value="0.07" aria-label="Circle centre forward offset in metres">
+      </label>
+    </div>
+    <svg class="drawing" data-footprint role="img" aria-label="Top view of the clearance circle, robot reference, forward offset and radius"></svg>
+    <div class="extent text-small tabular-nums" data-extents></div>
+  </section>
+  <section aria-labelledby="nav-lookahead-heading">
+    <h3 id="nav-lookahead-heading">Lookaheads · one direction, trials 1–6</h3>
+    <label class="form-label">Example obstacle ahead <span class="tabular-nums" data-obstacle-label>0.70 m</span>
+      <input class="form-range" data-obstacle type="range" min="0.30" max="1.70" step="0.01" value="0.70" aria-label="Example obstacle distance ahead of robot reference in metres">
+    </label>
+    <svg class="drawing" data-lookahead role="img" aria-label="Straight-ahead clearance test showing the swept circle, travel distance and an obstacle point"></svg>
+    <div class="trials" data-trials aria-label="Preview a lookahead trial"></div>
+    <div class="status text-small tabular-nums" aria-live="polite" data-status></div>
+  </section>
+</div>
+<script>
+(() => {
+  const root = document.getElementById('nav-params');
+  const q = s => root.querySelector(s);
+  const lengths = [1.20,0.80,0.60,0.35,0.12,0.06];
+  let selected = 3;
+  const fmt = n => n.toFixed(2) + ' m';
+  const line = (x1,y1,x2,y2,cls='dimension',extra='') => `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" class="${cls}" ${extra}/>`;
+  const text = (x,y,label,anchor='middle') => `<text x="${x}" y="${y}" text-anchor="${anchor}">${label}</text>`;
+  const dim = (a,b,y,label) => line(a,y,b,y)+line(a,y-4,a,y+4)+line(b,y-4,b,y+4)+text((a+b)/2,y-8,label);
+  const trialBox = q('[data-trials]');
+  lengths.forEach((v,i) => {
+    const b = document.createElement('button');
+    b.type='button'; b.className='btn';
+    b.addEventListener('click',()=>{selected=i;draw();});
+    trialBox.appendChild(b);
+  });
+  function values() {
+    return {r:+q('[data-radius]').value,o:+q('[data-offset]').value,d:+q('[data-obstacle]').value};
+  }
+  function draw() {
+    const {r,o,d}=values();
+    q('[data-radius-label]').textContent=fmt(r);
+    q('[data-offset-label]').textContent=fmt(o);
+    q('[data-obstacle-label]').textContent=fmt(d);
+    const first=lengths.findIndex(v=>d-o-r>v);
+    const w=Math.max(280,root.getBoundingClientRect().width);
+    const f=q('[data-footprint]');
+    const h=330, s=Math.min((w-42)/.85,350), x0=w/2-o*s/2, cy=162, cx=x0+o*s, R=r*s;
+    f.setAttribute('viewBox',`0 0 ${w} ${h}`);
+    f.style.height=h+'px';
+    f.innerHTML=`<title>Clearance circle</title><desc>A ${fmt(r)} radius circle centred ${fmt(o)} ahead of the robot reference point. Forward is right.</desc>`+
+      line(18,cy,w-18,cy,'structure')+
+      `<circle cx="${cx}" cy="${cy}" r="${R}" class="footprint"/>`+
+      line(x0,cy-6,x0,cy+6)+line(x0-6,cy,x0+6,cy)+
+      `<circle cx="${cx}" cy="${cy}" r="3" fill="var(--viz-series-1)"/>`+
+      line(cx,cy,cx,cy-R,'dimension')+text(cx+10,cy-R/2,'r = '+fmt(r),'start')+
+      dim(x0,cx,45,fmt(o)+' forward')+line(x0,52,x0,cy-10,'structure')+line(cx,52,cx,cy-R-5,'structure')+
+      line(x0,cy+8,x0,cy+R+24,'structure')+text(x0-6,cy+R+38,'Robot reference','end')+
+      line(cx,cy+8,cx,cy+R+48,'structure')+text(cx+6,cy+R+62,'Circle centre','start')+
+      text(w-18,24,'Forward →','end');
+    q('[data-extents]').innerHTML=`<span>Front: ${fmt(o+r)}</span><span>Rear: ${fmt(Math.max(0,r-o))}</span><span>Diameter: ${fmt(2*r)}</span>`;
+    const a=q('[data-lookahead]'), scale=(w-46)/2.05, ax=23, ay=116, ah=Math.ceil(ay+r*scale+82);
+    const X=v=>ax+(v+.27)*scale;
+    const start=X(o), end=X(o+lengths[selected]), rad=r*scale, ob=X(d);
+    const blocked=d-o-r<=lengths[selected];
+    a.setAttribute('viewBox',`0 0 ${w} ${ah}`); a.style.height=ah+'px';
+    a.innerHTML=`<title>Lookahead ${fmt(lengths[selected])}</title><desc>Illustrative single straight direction. The robot circle sweeps forward by ${fmt(lengths[selected])}. The obstacle is ${fmt(d)} ahead of the reference point. This trial is ${blocked?'blocked':'clear'}.</desc>`+
+      line(18,ay,w-18,ay,'structure')+
+      `<rect x="${start}" y="${ay-rad}" width="${end-start}" height="${2*rad}" class="sweep"/>`+
+      `<circle cx="${start}" cy="${ay}" r="${rad}" class="footprint"/>`+
+      `<circle cx="${end}" cy="${ay}" r="${rad}" class="footprint" stroke-dasharray="5 4"/>`+
+      line(X(0),ay-5,X(0),ay+5)+line(X(0)-5,ay,X(0)+5,ay)+
+      `<circle cx="${ob}" cy="${ay}" r="5" class="obstacle"/>`+
+      line(ob,ay-8,ob,49,'structure')+text(Math.min(w-10,ob+5),35,'Obstacle · '+fmt(d),ob>w*.65?'end':'start')+
+      dim(start,end,ay+rad+36,'Lookahead '+fmt(lengths[selected]))+
+      text(18,ah-8,'Solid: start circle','start')+text(w-18,ah-8,'Dashed: end circle','end');
+    [...trialBox.children].forEach((b,i)=>{
+      const status=first<0?'Blocked':i<first?'Blocked':i===first?'First clear':'Not tried';
+      b.setAttribute('aria-pressed',String(i===selected));
+      b.innerHTML=`<span class="trial-content"><span class="tabular-nums">${i+1} · ${fmt(lengths[i])}</span><span class="text-small">${status}</span></span>`;
+      b.setAttribute('aria-label',`Preview trial ${i+1}: ${fmt(lengths[i])}, ${status}`);
+    });
+    q('[data-status]').textContent=`Preview: trial ${selected+1} ${blocked?'blocked':'clear'} · ${first<0?'No clear lookahead': 'First clear: '+fmt(lengths[first])}`;
+  }
+  root.querySelectorAll('input').forEach(input=>input.addEventListener('input',()=>{
+    const {r,o,d}=values();
+    const first=lengths.findIndex(v=>d-o-r>v);
+    selected=first<0?5:first;
+    draw();
+  }));
+  new ResizeObserver(draw).observe(root);
+  draw();
+})();
+</script>

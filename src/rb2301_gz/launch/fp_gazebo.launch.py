@@ -74,6 +74,8 @@ def generate_launch_description():
 
     
     # launch Gz Harmonic
+    ld.add_action(DeclareLaunchArgument('gz_args', default_value=' -r -v1',
+                                      description='Gazebo flags; use -r -s --headless-rendering for terminal-only simulation'))
     launch_gz_sim = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             PathJoinSubstitution([
@@ -83,7 +85,7 @@ def generate_launch_description():
         launch_arguments={
             'gz_args': [
                 path_world,
-                TextSubstitution(text=' -r -v -v1'), # for non-VBox users
+                LaunchConfiguration('gz_args'),
                 # TextSubstitution(text=' -r -v -v1 --render-engine ogre'), # DO NOT USE: this may cause the last reading for VBox users to become 0.05. -r for autorun, -v for verbose, v1 for level 1 verbose.
             ], 
         }.items()
@@ -122,7 +124,7 @@ def generate_launch_description():
         package="ros_gz_bridge",
         executable="parameter_bridge",
         arguments=[
-            "/clock@rosgraph_msgs/msg/Clockgz.msgs.Clock",
+            "/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock",
             "/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist",
             "/odom@nav_msgs/msg/Odometry@gz.msgs.Odometry",
             "/joint_states@sensor_msgs/msg/JointState@gz.msgs.Model",
