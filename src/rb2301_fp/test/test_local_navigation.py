@@ -60,7 +60,7 @@ class LocalNavigationTests(unittest.TestCase):
             visited_cells={}, last_visit_cell=None,
             progress_direction=np.array([1., -1.]) / np.sqrt(2), progress_bias_weight=2.,
             rejected_targets=[], committed_target=np.array([1., 0.]),
-            points=np.asarray(points), robot_safe_radius=.14, clearance_margin=.03,
+            points=np.asarray(points), robot_safe_radius=.14, clearance_margin=.03, commit_margin=.01,
             reverse_penalty_weight=1.5,
             progress_distance=1., progress_time=11., blocked_since=None,
             navigation_speed=.35, Kp=3., Kd=0., Kp_theta=2., Kd_theta=.15,
@@ -69,7 +69,7 @@ class LocalNavigationTests(unittest.TestCase):
             get_logger=lambda: SimpleNamespace(info=lambda msg: None),
             get_clock=lambda: SimpleNamespace(now=lambda: 0))
         node.reset_target = lambda: ObstacleCourseNode.reset_target(node)
-        node.travel_direction = lambda: ObstacleCourseNode.travel_direction(node)
+        node.update_corridor_state = lambda *args: False
         return node, commands
 
     def test_blocked_target_is_released_after_wait(self):
@@ -153,18 +153,88 @@ class LocalNavigationTests(unittest.TestCase):
             ObstacleCourseNode.timer_callback(node)
         self.assertLess(node.committed_target[1], 0.)
 
-    def test_does_not_turn_back_toward_where_it_came_from(self):
-        # Robot drove -y (toward +x/-y bias would also favour -y). The only
-        # forward option is a short sideways gap; the long free path is behind.
+    def test_does_not_turn_back_against_corridor(self):
+        # Corridor runs -y. The forward option is a short side-step; the long
+        # free path behind should still lose.
         node, _ = self.controller(np.empty((0, 2)))
         node.committed_target = None
         node.progress_bias_weight = 0.
-        node.visited_positions = [np.array([0., .4]), np.array([0., .2]), np.zeros(2)]
+        node.progress_direction = np.array([0., -1.])
         node.valid_gaps = [dict(target=np.array([.4, -.3]), heading=-.6, free_depth=.5),
                            dict(target=np.array([0., 1.]), heading=math.pi/2, free_depth=1.)]
         with patch('rb2301_fp.obstacle_course.time.monotonic', return_value=11.):
             ObstacleCourseNode.timer_callback(node)
         self.assertLess(node.committed_target[1], 0.)
+
+    def corridor_node(self, index=0, pose=(0., 0., 0.)):
+        node = SimpleNamespace(pose=np.array(pose), side_depth=1.1, opening_min_width=.4,
+            min_corridor_travel=.8,
+            state_start=np.zeros(2), side_wall_seen=False, transition_since=None,
+            get_logger=lambda: SimpleNamespace(info=lambda msg: None))
+        node.corridors = [dict(name='C1', direction=np.array([1., 0.]), turn='right',
+                               side_depth=1.1),
+                          dict(name='C2', direction=np.array([0., -1.]), turn='left',
+                               side_depth=1.8),
+                          dict(name='C3', direction=np.array([1., 0.]), turn=None)]
+        node.enter_corridor = lambda i: ObstacleCourseNode.enter_corridor(node, i)
+        node.corridor_observation = lambda pts: ObstacleCourseNode.corridor_observation(node, pts)
+        node.enter_corridor(index)
+        node.state_start = np.zeros(2)
+        return node
+
+    @staticmethod
+    def wall(x0, x1, y):
+        return np.column_stack((np.arange(x0, x1, .02), np.full(len(np.arange(x0, x1, .02)), y)))
+
+    def test_corridor_1_straight_while_right_wall_present(self):
+        node = self.corridor_node(pose=(1., 0., 0.))
+        points = np.vstack((self.wall(-1, 3, .6), self.wall(-1, 3, -.6)))
+        beside, opening, end = ObstacleCourseNode.corridor_observation(node, points)
+        self.assertTrue(beside)
+        self.assertFalse(opening)
+        self.assertFalse(end)
+
+    def test_corridor_1_turns_right_when_right_wall_ends(self):
+        node = self.corridor_node(pose=(1., 0., 0.))
+        points = np.vstack((self.wall(-1, 3, .6), self.wall(-1, 1.05, -.6)))
+        for t in (10., 10.2, 10.4):
+            ObstacleCourseNode.update_corridor_state(node, points, t)
+        self.assertEqual(node.state_index, 1)
+        np.testing.assert_allclose(node.progress_direction, [0., -1.])
+
+    def test_box_beside_wall_does_not_trigger_turn_or_hide_gap_forever(self):
+        # 30 cm box against the right wall: wall is continuous, so no turn.
+        node = self.corridor_node(pose=(1., 0., 0.))
+        box = np.column_stack((np.full(15, 1.1), np.linspace(-.6, -.3, 15)))
+        points = np.vstack((self.wall(-1, 3, .6), self.wall(-1, 3, -.6), box))
+        _, opening, _ = ObstacleCourseNode.corridor_observation(node, points)
+        self.assertFalse(opening)
+
+    def test_end_wall_is_fallback_turn_cue(self):
+        node = self.corridor_node(pose=(1.9, 0., 0.))
+        # Right side hidden the whole way (box), but corridor ends at x=2.3.
+        points = np.vstack((self.wall(-1, 2.3, .6), self.wall(-1, 2.3, -.6),
+                            np.column_stack((np.full(60, 2.3), np.linspace(-.6, .6, 60)))))
+        _, _, end = ObstacleCourseNode.corridor_observation(node, points)
+        self.assertTrue(end)
+
+    def test_small_box_ahead_is_not_end_wall(self):
+        node = self.corridor_node(pose=(1., 0., 0.))
+        box = np.column_stack((np.full(20, 1.4), np.linspace(-.3, .2, 20)))
+        points = np.vstack((self.wall(-1, 3, .6), self.wall(-1, 3, -.6), box))
+        _, _, end = ObstacleCourseNode.corridor_observation(node, points)
+        self.assertFalse(end)
+
+    def test_corridor_2_turns_left(self):
+        node = self.corridor_node(index=1, pose=(1.7, -2.6, -90.))
+        node.state_start = np.array([1.7, -.3])
+        node.side_wall_seen = True
+        # Right wall (x=1.1) continues, left wall (x=2.3) ended at y=-2.4.
+        left = np.column_stack((np.full(60, 2.3), np.linspace(-2.4, 0, 60)))
+        right = np.column_stack((np.full(150, 1.1), np.linspace(-5, 0, 150)))
+        for t in (0., .2, .4):
+            ObstacleCourseNode.update_corridor_state(node, np.vstack((left, right)), t)
+        self.assertEqual(node.state_index, 2)
 
     def test_40cm_gap_is_passable(self):
         # Two wall posts 40 cm apart, 0.6 m ahead (robot frame +x).
@@ -181,6 +251,48 @@ class LocalNavigationTests(unittest.TestCase):
         node = self.analyze(ranges)
         self.assertTrue(any(abs(g['heading']) < math.radians(3) and g['target'][0] > .6
                             for g in node.valid_gaps))
+
+    def test_crossing_wall_after_turn_is_not_a_side_wall(self):
+        # Just turned into corridor 2 (-y). Corridor 1's far wall (y=0.6) runs
+        # across our path; the left side (+x) is the open end of corridor 1.
+        node = self.corridor_node(index=1, pose=(1.1, 0., -90.))
+        node.state_start = np.array([1., .4])
+        points = np.vstack((self.wall(-1, 2.3, .6),
+                            np.column_stack((np.full(150, 1.1 - .5), np.linspace(-5, -.6, 150)))))
+        beside, _, _ = ObstacleCourseNode.corridor_observation(node, points)
+        self.assertFalse(beside)
+        for t in (0., .2, .4):
+            ObstacleCourseNode.update_corridor_state(node, points, t)
+        self.assertEqual(node.state_index, 1)
+
+    def test_corridor_2_widening_is_not_the_gate(self):
+        # Left wall steps out from x=2.3 to x=2.9 at y=-1.8; gate is further down.
+        node = self.corridor_node(index=1, pose=(1.3, -1.9, -90.))
+        node.state_start = np.array([1.3, -.3])
+        node.side_wall_seen = True
+        points = np.vstack((
+            np.column_stack((np.full(60, 2.3), np.linspace(-1.8, 0, 60))),
+            np.column_stack((np.full(40, 2.9), np.linspace(-2.9, -1.8, 40))),
+            np.column_stack((np.full(150, 1.1), np.linspace(-5, 0, 150)))))
+        for t in (0., .2, .4):
+            ObstacleCourseNode.update_corridor_state(node, points, t)
+        self.assertEqual(node.state_index, 1)
+
+    def test_committed_path_survives_small_drift_in_tight_gap(self):
+        # Obstacle 16 cm from the path: below the 17 cm needed to choose it,
+        # but a committed path should not be dropped for it.
+        node, commands = self.controller([[.5, .16]])
+        with patch('rb2301_fp.obstacle_course.time.monotonic', return_value=11.):
+            ObstacleCourseNode.timer_callback(node)
+        self.assertIsNone(node.blocked_since)
+        self.assertGreater(commands[-1][0], 0.)
+
+    def test_committed_path_still_stops_for_real_obstruction(self):
+        node, commands = self.controller([[.5, .1]])
+        with patch('rb2301_fp.obstacle_course.time.monotonic', return_value=11.):
+            ObstacleCourseNode.timer_callback(node)
+        self.assertIsNotNone(node.blocked_since)
+        self.assertEqual(commands[-1], ())
 
 
 if __name__ == '__main__':

@@ -138,6 +138,11 @@ class ObstacleCourseNode(Node):
             'robot_safe_radius', 0.14).value)
         self.clearance_margin = float(self.declare_parameter(
             'clearance_margin', 0.03).value)
+        # Hysteresis: a path needs the full margin to be chosen, but once
+        # committed it is only dropped if something gets within this margin.
+        # Without it, 1-2 cm of drift in a tight gap flips "clear" to "blocked".
+        self.commit_margin = float(self.declare_parameter(
+            'commit_margin', 0.01).value)
         self.min_gap_width = 2 * self.robot_safe_radius
         self.valid_gaps = []
         self.points = None
@@ -158,23 +163,43 @@ class ObstacleCourseNode(Node):
             'lidar_yaw_deg', 180.0).value))
         self.navigation_speed = float(self.declare_parameter(
             'navigation_speed', 0.35 if is_simulation else 0.2).value)
-        # Maze-frame preference toward the course exit (+x, -y). It does not rotate
-        # with the robot, so successive local turns cannot redefine "forward".
-        bias = np.array([
-            float(self.declare_parameter('progress_bias_x', 1.0).value),
-            float(self.declare_parameter('progress_bias_y', -1.0).value)])
-        # Penalty for heading back against the recent direction of travel.
+        # Penalty for paths pointing back against the current corridor direction.
         self.reverse_penalty_weight = float(self.declare_parameter(
             'reverse_penalty_weight', 1.5).value)
         self.progress_bias_weight = float(self.declare_parameter(
             'progress_bias_weight', 2.0).value)
-        if not np.all(np.isfinite(bias)) or not math.isfinite(self.progress_bias_weight):
-            raise ValueError('Progress bias must contain finite numbers')
-        bias_length = np.linalg.norm(bias)
-        self.progress_direction = bias / bias_length if bias_length > 1e-9 else np.zeros(2)
-        self.get_logger().info(
-            f"Maze progress bias: {self.progress_direction.round(2)}, "
-            f"weight={self.progress_bias_weight:.2f}")
+        if not math.isfinite(self.progress_bias_weight):
+            raise ValueError('progress_bias_weight must be finite')
+        '''Corridor state machine'''
+        # The course is always an L-shape plus the gate leg; only lengths vary.
+        # Each corridor fixes which maze direction counts as "forward", and which
+        # side the next corridor opens on. The gap planner still does the avoiding.
+        # corridor_heading_deg rotates the whole layout if a real-robot frame differs.
+        base = math.radians(float(self.declare_parameter('corridor_heading_deg', 0.0).value))
+        def heading(deg):
+            return np.array([math.cos(base + math.radians(deg)),
+                             math.sin(base + math.radians(deg))])
+        # side_depth: how far to the side must be empty to count as an opening.
+        # Corridor 2 widens partway (its left wall steps out ~0.6 m) before the
+        # gate, so it needs a deeper check; the gate opens onto a wide area.
+        self.side_depth = float(self.declare_parameter('opening_side_depth', 1.1).value)
+        gate_depth = float(self.declare_parameter('gate_side_depth', 1.8).value)
+        self.corridors = [
+            dict(name='CORRIDOR_1', direction=heading(0), turn='right',
+                 side_depth=self.side_depth),
+            dict(name='CORRIDOR_2', direction=heading(-90), turn='left',
+                 side_depth=gate_depth),
+            dict(name='CORRIDOR_3_GATE', direction=heading(0), turn=None)]
+        start = int(self.declare_parameter('start_corridor', 1).value)
+        if not 1 <= start <= len(self.corridors):
+            raise ValueError(f'start_corridor must be 1..{len(self.corridors)}')
+        self.opening_min_width = float(self.declare_parameter('opening_min_width', 0.4).value)
+        # Distance into a corridor before its turn may trigger; the shortest
+        # leg is well over 1 m, and this ignores the corner we just turned at.
+        self.min_corridor_travel = float(self.declare_parameter(
+            'min_corridor_travel', 0.8).value)
+        self.state_index = None
+        self.enter_corridor(start - 1)
         self.last_scan_time = None
         self.scan_pose = None
         self.blocked_since = None
@@ -335,13 +360,72 @@ class ObstacleCourseNode(Node):
         self.PID_prev_time = current_time
 
         return Vx, Vy,w 
-    def travel_direction(self):
-        """Unit vector of recent motion (last ~0.4 m), or None if unknown."""
-        if len(self.visited_positions) < 3:
-            return None
-        motion = self.visited_positions[-1] - self.visited_positions[-3]
-        length = np.linalg.norm(motion)
-        return motion / length if length > 0.25 else None
+    def enter_corridor(self, index):
+        """Switch corridor: new forward direction, fresh opening detection."""
+        self.state_index = index
+        corridor = self.corridors[index]
+        self.progress_direction = corridor['direction']
+        self.side_wall_seen = False
+        self.transition_since = None
+        self.state_start = None if self.pose is None else self.pose[:2].copy()
+        self.get_logger().info(
+            f"State -> {corridor['name']}: forward={corridor['direction'].round(2)}, "
+            f"next opening on the {corridor['turn'] or 'n/a'}")
+
+    def corridor_observation(self, world_points):
+        """Return (side_wall_beside, side_opening, end_wall_ahead) for this corridor."""
+        corridor = self.corridors[self.state_index]
+        forward = corridor['direction']
+        left = np.array([-forward[1], forward[0]])
+        side = -left if corridor['turn'] == 'right' else left
+        rel = world_points - self.pose[:2]
+        along, lateral, across = rel @ forward, rel @ side, rel @ left
+        strip = (lateral > 0) & (lateral < corridor['side_depth'])
+        # A side wall runs alongside us: it must fill most slices over +/-0.3 m.
+        # A wall crossing our path (e.g. the previous corridor's end) fills one.
+        wall_beside = sum(bool(np.any(strip & (along >= a) & (along < a + 0.1)))
+                          for a in np.arange(-0.3, 0.3, 0.1)) >= 4
+        # Opening: a run of empty 10 cm slices beside/just ahead of the robot.
+        # Slicing means a box near the wall cannot hide a gap beside it.
+        run = best = 0
+        for start in np.arange(-0.2, 0.6, 0.1):
+            empty = not np.any(strip & (along >= start) & (along < start + 0.1))
+            run = run + 1 if empty else 0
+            best = max(best, run)
+        opening = best * 0.1 >= self.opening_min_width - 1e-6
+        # End wall: something within 0.6 m ahead in at least 9 of the 10 slices
+        # across +/-0.5 m. A side wall fills 1-2 slices and a box about 6, so
+        # only a wall across the corridor qualifies.
+        ahead = (along > 0.05) & (along < 0.6)
+        filled = sum(bool(np.any(ahead & (across >= c) & (across < c + 0.1)))
+                     for c in np.arange(-0.5, 0.5, 0.1))
+        end_wall = filled >= 9
+        return wall_beside, opening, end_wall
+
+    def update_corridor_state(self, world_points, now):
+        """Advance to the next corridor once its side opening is confirmed."""
+        if self.corridors[self.state_index]['turn'] is None or not len(world_points):
+            return False
+        if self.state_start is None:
+            self.state_start = self.pose[:2].copy()
+        wall_beside, opening, end_wall = self.corridor_observation(world_points)
+        self.side_wall_seen |= wall_beside
+        travelled = float((self.pose[:2] - self.state_start) @ self.progress_direction)
+        # "Wall seen, then gone" is the turn cue. The end wall is a fallback for
+        # an opening that was hidden (e.g. by a box) as we passed it.
+        ready = travelled > self.min_corridor_travel and (
+            (self.side_wall_seen and opening) or end_wall)
+        if not ready:
+            self.transition_since = None
+            return False
+        if self.transition_since is None:
+            self.transition_since = now
+        if now - self.transition_since < 0.3:  # must persist over a few scans
+            return False
+        reason = 'side opening' if opening and self.side_wall_seen else 'end wall'
+        self.get_logger().info(f"Corridor turn ({reason}) at {self.pose[:2].round(2)}")
+        self.enter_corridor(self.state_index + 1)
+        return True
 
     def reset_target(self):
         """Reset derivative history whenever the local goal changes."""
@@ -389,9 +473,13 @@ class ObstacleCourseNode(Node):
         points_now = (world_points - self.pose[:2]) @ rotation
         self.rejected_targets = [(p, expiry) for p, expiry in self.rejected_targets
                                  if expiry > now]
+        if self.update_corridor_state(world_points, now):
+            # Old target and rejections were chosen for the previous direction.
+            self.rejected_targets = []
+            self.reset_target()
         if self.committed_target is None:
             candidates = []
-            travel = self.travel_direction()
+            travel = self.progress_direction
             for gap in self.valid_gaps:
                 target_world = self.scan_pose[:2] + scan_rotation @ gap['target']
                 target_now = rotation.T @ (target_world - self.pose[:2])
@@ -407,11 +495,11 @@ class ObstacleCourseNode(Node):
                 # side-step around an obstacle is allowed; collision checks
                 # still decide which paths may become candidates at all.
                 maze_progress = float((target_world - self.pose[:2]) @ self.progress_direction)
-                # Discourage U-turns: only paths pointing back along where we
-                # just drove are penalised; sideways and forward cost nothing.
+                # Discourage U-turns: only paths pointing back against the
+                # corridor direction are penalised; sidesteps cost nothing.
                 reverse = 0.0
                 offset = target_world - self.pose[:2]
-                if travel is not None and np.linalg.norm(offset) > 1e-6:
+                if np.linalg.norm(offset) > 1e-6:
                     reverse = max(0.0, -float(offset @ travel) / np.linalg.norm(offset))
                 score = (0.6 * gap['free_depth'] + 0.3 * np.cos(candidate_heading)
                          - self.reverse_penalty_weight * reverse
@@ -446,7 +534,7 @@ class ObstacleCourseNode(Node):
             # Points behind the start cannot obstruct translation away from them.
             # This matches candidate generation and lets us leave a tight corner.
             blocked = bool(np.any((along > 0) &
-                (clearance < self.robot_safe_radius + self.clearance_margin)))
+                (clearance < self.robot_safe_radius + self.commit_margin)))
         if self.progress_distance is None or distance < self.progress_distance - 0.03:
             self.progress_distance, self.progress_time = distance, now
         if blocked:
@@ -458,7 +546,11 @@ class ObstacleCourseNode(Node):
         # so replanning cannot immediately select the same blocked position.
         if ((self.blocked_since is not None and now - self.blocked_since > 0.7) or
                 now - self.progress_time > 5.0):
-            self.get_logger().info("Replanning: target blocked or no distance progress")
+            why = ("blocked" if self.blocked_since is not None and now - self.blocked_since > 0.7
+                   else "no progress for 5 s")
+            self.get_logger().info(
+                f"Replanning: {why} (target {self.committed_target.round(2)}, "
+                f"pose {self.pose.round(2)})")
             self.rejected_targets.append((self.committed_target.copy(), now + 12.0))
             self.reset_target()
             self.move_2D()
