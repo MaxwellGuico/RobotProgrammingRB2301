@@ -11,7 +11,7 @@ from rb2301_fp.obstacle_course import ObstacleCourseNode, path_visit_cost, visit
 class LocalNavigationTests(unittest.TestCase):
     def analyze(self, ranges, offset=0.11423):
         node = SimpleNamespace(lidar_min_distance=0.0, lidar_max_distance=5.0,
-                               robot_safe_radius=0.14, clearance_margin=.03, commit_margin=.01,
+                               robot_safe_radius=0.14, clearance_margin=.03, commit_margin=.01, nose_overhang=.04,
                                lidar_x_offset=offset,
                                lidar_yaw=math.pi, pose=None)
         scan = SimpleNamespace(ranges=ranges, angle_min=-math.pi,
@@ -62,20 +62,22 @@ class LocalNavigationTests(unittest.TestCase):
             progress_direction=np.array([1., -1.]) / np.sqrt(2), progress_bias_weight=2.,
             rejected_targets=[], committed_target=np.array([1., 0.]),
             points=np.asarray(points), robot_safe_radius=.14, clearance_margin=.03, commit_margin=.01,
-            reverse_penalty_weight=1.5,
+            nose_overhang=.04, reverse_penalty_weight=1.5,
             progress_distance=1., progress_time=11., blocked_since=None,
             navigation_speed=.35, Kp=3., Kd=0., Kp_theta=2., Kd_theta=.15,
             PID=lambda *args: (.1, 0., 0.),
             move_2D=lambda *args: commands.append(args),
-            get_logger=lambda: SimpleNamespace(info=lambda msg: None),
+            get_logger=lambda: SimpleNamespace(info=lambda msg: None, warn=lambda msg: None),
             get_clock=lambda: SimpleNamespace(now=lambda: 0))
-        node.corridors = [dict(name='C1', direction=np.array([1., 0.]), turn='right')]
+        node.corridors = [dict(name='C1', direction=np.array([1., 0.]), turn='right'),
+                          dict(name='C3', direction=np.array([1., 0.]), turn=None)]
         node.state_index, node.gate, node.gate_phase = 0, None, None
         for name in ('reset_target', 'step_corridor_state', 'step_gate_detection',
                      'step_gate_approach', 'step_drive', 'gate_waypoint', 'path_is_clear',
-                     'in_gate_corridor'):
+                     'in_gate_corridor', 'step_dynamic_obstacles'):
             setattr(node, name, MethodType(getattr(ObstacleCourseNode, name), node))
         node.update_corridor_state = lambda *args: False
+        node.update_wall_direction = lambda *args: None  # tests set directions themselves
         return node, commands
 
     def test_blocked_target_is_released_after_wait(self):
@@ -443,6 +445,111 @@ class LocalNavigationTests(unittest.TestCase):
             ObstacleCourseNode.optitrack_callback(node, self.pose_msg(2., 3., 90.))
         np.testing.assert_allclose(node.pose, [0., 0., 0.], atol=1e-9)
         np.testing.assert_allclose(node.maze_pose, [2., 3., 90.], atol=1e-9)
+    def dyn_node(self):
+        node = SimpleNamespace(cross_margin=.06, BODY_HALF_WIDTH=.11, BODY_FRONT=.18,
+                               BODY_REAR=.034, pose=np.zeros(3))
+        node.corridors = [dict(name='C3', direction=np.array([1., 0.]), turn=None)]
+        node.state_index = 0
+        node.corridor_axes = lambda: ObstacleCourseNode.corridor_axes(node)
+        return node
+
+    def test_dynamic_points_only_reports_what_moved(self):
+        wall = np.column_stack((np.linspace(0, 2, 50), np.full(50, 1.)))
+        node = SimpleNamespace(scan_history=deque([
+            dict(time=0., points=np.vstack((wall, [[1., 0.2]]))),
+            dict(time=.5, points=np.vstack((wall, [[1., -0.2]])))]))
+        moved = ObstacleCourseNode.dynamic_points(node, since=0.)
+        np.testing.assert_allclose(moved, [[1., -0.2]])
+
+    def test_lane_ahead_finds_nearest_moving_obstacle(self):
+        node = self.dyn_node()
+        near = np.column_stack((np.full(8, .8), np.linspace(-.15, .15, 8)))
+        far = np.column_stack((np.full(8, 1.4), np.linspace(.3, .6, 8)))
+        lane = ObstacleCourseNode.lane_ahead(node, np.vstack((near, far)))
+        self.assertAlmostEqual(lane['s'], .8)
+
+    def test_stray_points_do_not_hide_lane(self):
+        node = self.dyn_node()
+        stray = np.array([[.3, 1.0], [.32, -1.2]])
+        lane = np.column_stack((np.full(8, .8), np.linspace(-.15, .15, 8)))
+        found = ObstacleCourseNode.lane_ahead(node, np.vstack((stray, lane)))
+        self.assertAlmostEqual(found['s'], .8)
+
+    def test_nose_keeps_margin_from_wall_ahead(self):
+        # Wall straight ahead at x=1.0 (robot frame): the target must leave the
+        # nose (0.18 m ahead of base_link) at least the margin away.
+        offset = 0.11423
+        ranges = [float('inf')] * 360
+        for y in np.linspace(-1, 1, 400):
+            sx = 1.0 - offset
+            angle = math.atan2(y, sx) - math.pi
+            i = int(round((math.atan2(math.sin(angle), math.cos(angle)) + math.pi)
+                          / (2 * math.pi / 360))) % 360
+            ranges[i] = min(ranges[i], math.hypot(sx, y))
+        node = self.analyze(ranges)
+        ahead = [g for g in node.valid_gaps if abs(g['heading']) < 1e-6]
+        self.assertTrue(ahead)
+        self.assertLessEqual(ahead[0]['target'][0] + .18, 1.0 - .03 + 1e-6)
+
+    def test_strip_ignores_wall_beside_but_sees_obstacle_ahead(self):
+        node = self.dyn_node()
+        wall_beside = np.column_stack((np.linspace(-.5, 1.5, 50), np.full(50, -.2)))
+        self.assertFalse(ObstacleCourseNode.strip_blocked(node, wall_beside, .8))
+        board = np.column_stack((np.full(10, .5), np.linspace(-.1, .2, 10)))
+        self.assertTrue(ObstacleCourseNode.strip_blocked(node, np.vstack((wall_beside, board)), .8))
+        # Beyond the strip end (next lane) does not count.
+        self.assertFalse(ObstacleCourseNode.strip_blocked(node, board + [.5, 0.], .8))
+
+    def test_right_clearance_ignores_corner_behind(self):
+        node = self.dyn_node()
+        behind = np.array([[-.1, -.15]])           # gate wall end behind the rear
+        beside = np.array([[.05, -.30], [.1, -.31]])  # wall alongside
+        self.assertAlmostEqual(
+            ObstacleCourseNode.right_clearance(node, np.vstack((behind, beside))), .30 - .11)
+
+    def test_nose_gap_sees_wall_ahead_only(self):
+        node = self.dyn_node()
+        wall_ahead = np.column_stack((np.full(20, .5), np.linspace(-.3, .3, 20)))
+        side = np.array([[.3, .5]])
+        self.assertAlmostEqual(ObstacleCourseNode.nose_gap(node, np.vstack((wall_ahead, side))),
+                               .5 - .18)
+
+    def test_wall_direction_follows_skewed_walls(self):
+        # Corridor nominally +x, but both walls are rotated by 7 degrees.
+        skew = math.radians(7)
+        t = np.linspace(-1.4, 1.4, 120)
+        d, n = np.array([math.cos(skew), math.sin(skew)]), np.array([-math.sin(skew), math.cos(skew)])
+        points = np.vstack((t[:, None] * d + .6 * n, t[:, None] * d - .6 * n))
+        node = self.corridor_node()
+        node.corridor_axes = lambda: ObstacleCourseNode.corridor_axes(node)
+        for _ in range(30):  # smoothed: converges over several scans
+            ObstacleCourseNode.update_wall_direction(node, points)
+        self.assertAlmostEqual(node.wall_offset, skew, places=3)
+        np.testing.assert_allclose(ObstacleCourseNode.corridor_axes(node)[1], d, atol=1e-3)
+
+    def test_wall_direction_ignores_large_angles(self):
+        # 30 degrees off is not "slightly skewed": keep the square assumption.
+        skew = math.radians(30)
+        t = np.linspace(-1.4, 1.4, 120)
+        d = np.array([math.cos(skew), math.sin(skew)])
+        node = self.corridor_node()
+        node.corridor_axes = lambda: ObstacleCourseNode.corridor_axes(node)
+        ObstacleCourseNode.update_wall_direction(node, t[:, None] * d + [0., .6])
+        self.assertEqual(getattr(node, 'wall_offset', 0.0), 0.0)
+
+    def test_gate_found_in_skewed_wall(self):
+        # Rotate the whole corridor-2 test world by 6 degrees about the robot.
+        skew = math.radians(6)
+        node = self.gate_node()
+        node.wall_offset = skew
+        R = np.array([[math.cos(skew), -math.sin(skew)], [math.sin(skew), math.cos(skew)]])
+        pivot = node.pose[:2]
+        world = (self.gate_world() - pivot) @ R.T + pivot
+        gates = ObstacleCourseNode.detect_gate_candidates(node, world)
+        self.assertEqual(len(gates), 1)
+        np.testing.assert_allclose(gates[0]['centre'], (np.array([2.9, -3.05]) - pivot) @ R.T + pivot,
+                                   atol=.04)
+
 
 if __name__ == '__main__':
     unittest.main()
