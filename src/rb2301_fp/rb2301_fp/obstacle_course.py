@@ -2,6 +2,7 @@ import argparse
 import configparser
 import math
 import os
+import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -52,6 +53,22 @@ def load_frame(robot_number:int) -> tuple:
     course = {k: parser.getfloat("course", k, fallback=0.0) for k in ("origin_x", "origin_y", "rotation_deg")}
     return frame, course
 
+def visit_cell(point, size=0.25):
+    """World-fixed cells keep their meaning when the robot turns around."""
+    return tuple(np.floor(np.asarray(point) / size).astype(int))
+
+
+def path_visit_cost(start, target, visits):
+    """Penalize repeated traversal, including the path before its endpoint."""
+    distance = np.linalg.norm(target - start)
+    if distance < 1e-6:
+        return 0.0
+    # Ignore the first 20 cm: every outgoing path shares the robot's current cell.
+    fractions = np.linspace(min(0.2 / distance, 1.0), 1.0, 8)
+    cells = {visit_cell(start + t * (target - start)) for t in fractions}
+    return float(np.mean([min(visits.get(cell, 0), 5) for cell in cells]))
+
+
 class LidarNode(Node):
     def __init__(self):
         """Node constructor"""
@@ -83,7 +100,9 @@ class ObstacleCourseNode(Node):
         else:
             self.max_translate_velocity = 0.3 # Please keep this in place; 0.3m/s is more than fast enough 
 
-        self.sub_scan = self.create_subscription(LaserScan, "scan", self.sub_scan_callback, 2) # Subscribe to LiDAR scan data
+        self.sub_scan = self.create_subscription(
+            LaserScan, "scan", self.sub_scan_callback,
+            QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT))
 
         # Subscribe to the dynamic_pose topic from Gazebo that publishes ground-truth pose data
         if self.is_simulation:
@@ -113,132 +132,127 @@ class ObstacleCourseNode(Node):
         self.lidar_max_distance = 5.0
         self.angle_min = 0.0
         self.angle_increment = 0.0
-        self.robot_safe_radius = 0.17
+        # Robot body is ~22 cm wide (half-width 0.11 m). With the margin below,
+        # 0.14 needs a ~34 cm gap; the old 0.17 needed over 40 cm.
+        self.robot_safe_radius = float(self.declare_parameter(
+            'robot_safe_radius', 0.14).value)
+        self.clearance_margin = float(self.declare_parameter(
+            'clearance_margin', 0.03).value)
         self.min_gap_width = 2 * self.robot_safe_radius
         self.valid_gaps = []
         self.points = None
         '''PID Variables'''
-        self.Kp,self.Kd,self.Kp_theta,self.Kd_theta = 3.0, 0.8,3.0,0.8
+        # Local goals change often: avoid distance derivative kicks and use
+        # gentler angular damping so a new goal does not cause a sharp spin.
+        self.Kp,self.Kd,self.Kp_theta,self.Kd_theta = 3.0, 0.0, 2.0, 0.15
         self.error_distance_prev = None
         self.error_heading_prev = None
         self.PID_prev_time = self.get_clock().now()
         '''Callback Variables'''
         self.committed_target = None
+        # The simulated scanner faces backwards and sits ahead of base_link.
+        # Parameters let hardware use its own measured mounting transform.
+        self.lidar_x_offset = float(self.declare_parameter(
+            'lidar_x_offset', 0.11423 if is_simulation else 0.0).value)
+        self.lidar_yaw = math.radians(float(self.declare_parameter(
+            'lidar_yaw_deg', 180.0).value))
+        self.navigation_speed = float(self.declare_parameter(
+            'navigation_speed', 0.35 if is_simulation else 0.2).value)
+        # Maze-frame preference toward the course exit (+x, -y). It does not rotate
+        # with the robot, so successive local turns cannot redefine "forward".
+        bias = np.array([
+            float(self.declare_parameter('progress_bias_x', 1.0).value),
+            float(self.declare_parameter('progress_bias_y', -1.0).value)])
+        # Penalty for heading back against the recent direction of travel.
+        self.reverse_penalty_weight = float(self.declare_parameter(
+            'reverse_penalty_weight', 1.5).value)
+        self.progress_bias_weight = float(self.declare_parameter(
+            'progress_bias_weight', 2.0).value)
+        if not np.all(np.isfinite(bias)) or not math.isfinite(self.progress_bias_weight):
+            raise ValueError('Progress bias must contain finite numbers')
+        bias_length = np.linalg.norm(bias)
+        self.progress_direction = bias / bias_length if bias_length > 1e-9 else np.zeros(2)
+        self.get_logger().info(
+            f"Maze progress bias: {self.progress_direction.round(2)}, "
+            f"weight={self.progress_bias_weight:.2f}")
+        self.last_scan_time = None
+        self.scan_pose = None
+        self.blocked_since = None
+        self.progress_distance = None
+        self.progress_time = time.monotonic()
+        self.rejected_targets = []
         '''Distance based Recording of visted history'''
         self.visited_positions = []
         self.history_spacing = 0.2
         self.visit_radius = 0.5 # metres
-
+        self.visited_cells = {}
+        self.last_visit_cell = None
     def sub_scan_callback(self, msg):
-        """Scan subscriber"""
+        """Build short collision-free paths instead of treating depth jumps as doors."""
+        self.last_scan_time = time.monotonic()
+        # Keep scan geometry tied to the pose at reception. A later timer may
+        # run after the robot has turned; those points are not in its new frame.
+        self.scan_pose = self.pose.copy() if self.pose is not None else None
         self.angle_min = msg.angle_min
         self.angle_increment = msg.angle_increment
-        if len(msg.ranges) <= 360:
-            self.last_scan = np.array(msg.ranges)
-        else:
-            self.last_scan = np.array(msg.ranges)[::2] 
-            self.angle_increment *= 2
-        # Boolean masking to get valid measurements, better than np.clip because if np.inf and we change it to lets say 5.0, it thinks theres an obstacle there.
-        valid = (
-            np.isfinite(self.last_scan)
-            & (self.last_scan >= max(self.lidar_min_distance, msg.range_min))
-            & (self.last_scan <= min(self.lidar_max_distance, msg.range_max))
-        )
-        #theta i = self.angle_min + index x self.angle_increment
-        self.angles = (
-            self.angle_min
-            + np.arange(len(self.last_scan)) * self.angle_increment
-        )
-        # Preserve original indices
-        # Lidar points give (r,theta)
-        # Convert to cartesian coordinates
-        x = self.last_scan[valid] * np.cos(self.angles[valid])
-        y = self.last_scan[valid] * np.sin(self.angles[valid])
-
-        self.points = np.column_stack((x, y)) # Combine into points (N,2) given N is number of lidar scans
-        if len(self.points) < 2: # edge case: if every measurement is invalid, clustering will give empty cluster
-            self.valid_gaps = []
+        self.last_scan = np.asarray(msg.ranges, dtype=float)
+        self.angles = msg.angle_min + np.arange(len(self.last_scan)) * msg.angle_increment
+        self.valid_gaps = []
+        self.points = np.empty((0, 2))
+        if not len(self.last_scan) or msg.angle_increment <= 0:
             return
-        # Cluster LiDar Points
-        differences = self.points[1:] - self.points[:-1] # Example, P1 - P0, P2 - p1, P3 - P2 pattern
-        distances = np.linalg.norm(differences, axis=1) # get the euclidean distance for each row
-        valid_indices = np.where(valid)[0] # theres a gap if you dont filter with valid
-        index_differences = valid_indices[1:] - valid_indices[:-1]
-        boundaries = np.where((distances > 0.2) | (index_differences > 1))[0] # get points that are far apart, because we are looking for cluster boundaries to tell us where a cluster starts and ends
-        # Splitting into clusters
-        # np.split() splits BEFORE the specified index
-        split_indices = boundaries + 1
-        clusters = np.split(self.points, split_indices) # list of numpy arrays
-        # clusters = [c for c in clusters if len(c) >= 2] # filter out for lidar noise, if there is less than 2 valid points, remove it
-        # Detect Gaps between adjacent clusters
-        '''
-        CLUSTER A                  CLUSTER B
 
-        •──•──•──A                 B──•──•──•
-                ↑                 ↑
-            Last point        First point
-        
-        '''
-        valid_gaps = list()
-        for i in range(len(clusters) - 1):
-            point_A = clusters[i][-1]  # Last point of Cluster 0
-            point_B = clusters[i+1][0]   # First point of Cluster 1
-            gap_width = np.linalg.norm((point_B - point_A)) # Eucldiean distance
+        # +inf means no return within range; NaN/too-short readings are unknown.
+        # Keep unknown readings blocked rather than opening an imaginary passage.
+        max_range = min(self.lidar_max_distance, msg.range_max)
+        known = ((np.isfinite(self.last_scan) &
+                  (self.last_scan >= max(msg.range_min, self.lidar_min_distance))) |
+                 np.isposinf(self.last_scan))
+        ranges = np.where(known, np.minimum(self.last_scan, max_range), 0.0)
+        self.scan_ranges = ranges
+        angles_robot = self.angles + self.lidar_yaw
+        # Apply BOTH rotation and translation before checking robot clearance.
+        hits = np.isfinite(self.last_scan) & known & (self.last_scan <= max_range)
+        self.points = np.column_stack((
+            self.lidar_x_offset + self.last_scan[hits] * np.cos(angles_robot[hits]),
+            self.last_scan[hits] * np.sin(angles_robot[hits])))
+        # Inflate each return by robot radius + margin. Sampling directions over
+        # the full circle also handles openings across the scan's -pi/pi seam.
+        radius = self.robot_safe_radius + self.clearance_margin
+        for heading in np.deg2rad(np.arange(-180, 180, 5)):
+            direction = np.array([np.cos(heading), np.sin(heading)])
+            reach = 1.0
+            if len(self.points):
+                along = self.points @ direction
+                perpendicular_sq = np.maximum(0.0,
+                    np.sum(self.points ** 2, axis=1) - along ** 2)
+                intersects = (perpendicular_sq < radius ** 2) & (along > 0)
+                if np.any(intersects):
+                    entry = along[intersects] - np.sqrt(
+                        radius ** 2 - perpendicular_sq[intersects])
+                    reach = min(reach, float(np.min(entry)) - 0.02)
+            # A useful local target must advance at least 25 cm. It need not
+            # cross a doorway or travel 50 cm beyond an occluding obstacle.
+            if reach < 0.25:
+                continue
+            target = reach * direction
+            sensor_target = target - np.array([self.lidar_x_offset, 0.0])
+            sensor_angle = math.atan2(sensor_target[1], sensor_target[0]) - self.lidar_yaw
+            sensor_angle = math.atan2(math.sin(sensor_angle), math.cos(sensor_angle))
+            index = int(round((sensor_angle - msg.angle_min) / msg.angle_increment))
+            # Check neighboring rays too: one long beam does not prove width.
+            neighborhood = np.arange(index - 1, index + 2)
+            full_circle = len(ranges) * msg.angle_increment >= 2 * np.pi - 0.05
+            if full_circle:
+                neighborhood %= len(ranges)
+            elif np.any((neighborhood < 0) | (neighborhood >= len(ranges))):
+                continue
+            if np.min(ranges[neighborhood]) < np.linalg.norm(sensor_target) + radius:
+                continue
+            self.valid_gaps.append({
+                'target': target, 'free_depth': reach,
+                'gap_width': 2 * radius, 'heading': heading})
 
-            if gap_width >= self.min_gap_width:
-                gap_midpoint = (point_A + point_B) / 2
-                '''Estimate: free-space depth'''
-                free_depth = 0.0
-                theta_midpoint = np.arctan2(gap_midpoint[1],gap_midpoint[0])
-                index = int(round((theta_midpoint - self.angle_min)/ self.angle_increment))
-                if 0 <= index < len(self.last_scan): # checking that the index is valid
-                    lidar_distance = self.last_scan[index]
-                    max_range = min(self.lidar_max_distance, msg.range_max)
-                    if(np.isfinite(lidar_distance) and lidar_distance >= self.lidar_min_distance and lidar_distance <= self.lidar_max_distance): # normal reading
-                        free_depth = max(0,lidar_distance - np.linalg.norm(gap_midpoint))
-                    elif np.isposinf(lidar_distance): # Edge case, if lidar distance is inf
-                        free_depth = max(0,max_range - np.linalg.norm(gap_midpoint))
-                    else: # if np.nan
-                        free_depth = 0.0
-                '''Collision Checking'''
-                # Calculate crossing direction
-                gap_vector = point_B - point_A
-                normal = np.array([-gap_vector[1], gap_vector[0]])
-
-                # Ensure normal points away from robot
-                if np.dot(normal, gap_midpoint) < 0:
-                    normal = -normal
-
-                # Normalize
-                normal = normal / np.linalg.norm(normal)
-
-                # Calculate crossing target, its a point after the midpoint
-                crossing_distance = 0.5
-                crossing_target = gap_midpoint + crossing_distance * normal
-                # Use projections to see if the points will hit the robot
-                # t = P dot M / M dot M
-                denominator = np.dot(crossing_target, crossing_target)
-                if denominator < 1e-6:
-                    continue
-                numerator = self.points @ crossing_target
-                t = np.clip(numerator / denominator,0,1) # size (N,), clip to ensure it fits 0 and 1
-                # Q = R + t(M - R) but since its relative to robot now, R is (0,0)
-                Q = t[:, None] * crossing_target # (N,1) * N,2
-                D = np.linalg.norm((self.points - Q), axis=1)
-
-
-                '''Valid Candidate Gaps'''
-                if np.min(D) > self.robot_safe_radius:
-                    valid_gaps.append({
-                        'gap_width': gap_width,
-                        'free_depth' : free_depth,
-                        'target': crossing_target,
-                        'A': point_A,
-                        'B': point_B
-                    })
-        self.valid_gaps = valid_gaps
-                
-        
     def yaw_from_quaternion(self, q):
         '''Returns yaw angle (in rad) for orientation based on given quaternion input q'''
         siny_cosp = 2 * (q.w * q.z + q.x * q.y)
@@ -306,7 +320,10 @@ class ObstacleCourseNode(Node):
         Vx = np.clip(Vx, 0.0, self.max_translate_velocity)
         Vx *= max(0.0, 0.5 * np.cos(error_heading)) # Slows down during turning
         Vy = 0
-        w =  Kp_theta * error_heading + Kd_theta* ((error_heading-self.error_heading_prev)/((dt.nanoseconds/1e9))) \
+        # Wrap the derivative too: crossing +/-pi is not a 2*pi heading jump.
+        heading_delta = math.atan2(math.sin(error_heading-self.error_heading_prev),
+                                   math.cos(error_heading-self.error_heading_prev))
+        w =  Kp_theta * error_heading + Kd_theta* (heading_delta/((dt.nanoseconds/1e9))) \
                    if (dt.nanoseconds/1e9) > 1e-9 else Kp_theta *(error_heading)
         
         self.get_logger().debug(f"Error Distance: {error_distance} Turning Correction Applied: {max(0.0, np.cos(error_heading))} Vx: {Vx}")
@@ -318,120 +335,149 @@ class ObstacleCourseNode(Node):
         self.PID_prev_time = current_time
 
         return Vx, Vy,w 
+    def travel_direction(self):
+        """Unit vector of recent motion (last ~0.4 m), or None if unknown."""
+        if len(self.visited_positions) < 3:
+            return None
+        motion = self.visited_positions[-1] - self.visited_positions[-3]
+        length = np.linalg.norm(motion)
+        return motion / length if length > 0.25 else None
+
+    def reset_target(self):
+        """Reset derivative history whenever the local goal changes."""
+        self.committed_target = None
+        self.error_distance_prev = self.error_heading_prev = None
+        self.PID_prev_time = self.get_clock().now()
+        self.blocked_since = None
+        self.progress_distance = None
+        self.progress_time = time.monotonic()
+
     def timer_callback(self):
-        """Controller loop. Insert path planning and PID control logic here"""
+        """Select a local free path, follow it, and replan if it stops working."""
         if self.pose is None:
-            print("No pose detected")
-            return # Does not run if no pose received from Odom or Optitrack
-        '''Calibration'''
-        if self.calibrate and self.raw_pose is not None:
+            return
+        if self.calibrate:
+            # Calibration must never drive, even if accidentally used in Gazebo.
+            self.move_2D()
             self._ticks += 1
-            if self._ticks % 10 == 0: # twice a second
-                ox, oy, oh = self.raw_pose
-                self.get_logger().info(f"optitrack ({ox:+.3f}, {oy:+.3f}, {oh:+7.1f} deg)  ->  maze ({self.pose[0]:+.3f}, {self.pose[1]:+.3f}, {self.pose[2]:+7.1f} deg)")
-            return # Calibration mode: look, don't drive
-
-        ###### INSERT CODE HERE ######
-        self.get_logger().info(f"Pose: {self.pose}")       
-        '''Position History'''
-        if not self.visited_positions:
+            if self._ticks % 10 == 0:
+                self.get_logger().info(f"Calibration pose: {self.pose}")
+            return
+        now = time.monotonic()
+        if (self.last_scan_time is None or self.scan_pose is None or
+                now - self.last_scan_time > 0.5):
+            self.move_2D()
+            return
+        if not self.visited_positions or np.linalg.norm(
+                self.pose[:2] - self.visited_positions[-1]) >= self.history_spacing:
             self.visited_positions.append(self.pose[:2].copy())
-
-        elif np.linalg.norm(
-            self.pose[:2] - self.visited_positions[-1]
-        ) >= self.history_spacing:
-            self.visited_positions.append(self.pose[:2].copy())
-        # Convert carrot to real world coordinates Cw = R + RotationR*Carrot
+            cell = visit_cell(self.pose[:2])
+            # Count re-entry instead of elapsed time: pausing or rotating in
+            # place must not make every possible exit increasingly expensive.
+            if cell != self.last_visit_cell:
+                self.visited_cells[cell] = self.visited_cells.get(cell, 0) + 1
+                self.last_visit_cell = cell
         theta = np.deg2rad(self.pose[2])
-        rotation = np.array([
-            [np.cos(theta), -np.sin(theta)],
-            [np.sin(theta),  np.cos(theta)]
-        ])
-        '''
-        Target Selection
-        gap['target'] is w.r.t Robot
-        self.committed_target is w.r.t World
-        target_robot_frame is w.r.t Robot
-        '''
-        # Only select a new target if none is committed
+        rotation = np.array([[np.cos(theta), -np.sin(theta)],
+                             [np.sin(theta), np.cos(theta)]])
+        scan_theta = np.deg2rad(self.scan_pose[2])
+        scan_rotation = np.array([[np.cos(scan_theta), -np.sin(scan_theta)],
+                                  [np.sin(scan_theta), np.cos(scan_theta)]])
+        # Re-express the cached scan in the CURRENT robot frame before checking
+        # a path. Otherwise a wall rotates with the robot between scan callbacks.
+        world_points = self.scan_pose[:2] + self.points @ scan_rotation.T
+        points_now = (world_points - self.pose[:2]) @ rotation
+        self.rejected_targets = [(p, expiry) for p, expiry in self.rejected_targets
+                                 if expiry > now]
         if self.committed_target is None:
-            if not self.valid_gaps:
-                self.move_2D(0.0, 0.0, 0.0)
-                return
-            '''
-            Gap Scoring
-            Importance of width * Normalised gap width + Importance of depth * Normalised depth
-            '''
-            # For now its based on width and depth
-            max_width = max(gap['gap_width'] for gap in self.valid_gaps)
-            max_depth = max(gap['free_depth'] for gap in self.valid_gaps)
-            # Calculate score for each gap
+            candidates = []
+            travel = self.travel_direction()
             for gap in self.valid_gaps:
-                normalised_gap = gap['gap_width'] / max_width if max_width > 0 else 0.0
-                normalised_depth = gap['free_depth'] / max_depth if max_depth > 0 else 0.0
+                target_world = self.scan_pose[:2] + scan_rotation @ gap['target']
+                target_now = rotation.T @ (target_world - self.pose[:2])
+                candidate_heading = math.atan2(target_now[1], target_now[0])
+                if any(np.linalg.norm(target_world - p) < 0.35
+                       for p, _ in self.rejected_targets):
+                    continue
+                # The old nearest-point penalty saturated after one visit and
+                # ignored revisits along the path. Repeated loops now cost more.
+                visited = path_visit_cost(self.pose[:2], target_world, self.visited_cells)
+                endpoint_visits = min(self.visited_cells.get(visit_cell(target_world), 0), 5)
+                # Signed metres of progress in the fixed maze direction. A
+                # side-step around an obstacle is allowed; collision checks
+                # still decide which paths may become candidates at all.
+                maze_progress = float((target_world - self.pose[:2]) @ self.progress_direction)
+                # Discourage U-turns: only paths pointing back along where we
+                # just drove are penalised; sideways and forward cost nothing.
+                reverse = 0.0
+                offset = target_world - self.pose[:2]
+                if travel is not None and np.linalg.norm(offset) > 1e-6:
+                    reverse = max(0.0, -float(offset @ travel) / np.linalg.norm(offset))
+                score = (0.6 * gap['free_depth'] + 0.3 * np.cos(candidate_heading)
+                         - self.reverse_penalty_weight * reverse
+                         - 1.2 * visited - 0.5 * endpoint_visits
+                         + self.progress_bias_weight * maze_progress)
+                candidates.append((score, gap, target_world))
+            # Score ALL directions together. Filtering to forward paths first
+            # discarded fresh exits behind us, regardless of the visit penalty.
+            choices = candidates
+            if not choices:
+                self.move_2D()
+                return
+            _, gap, self.committed_target = max(choices, key=lambda c: c[0])
+            selected_relative = rotation.T @ (self.committed_target - self.pose[:2])
+            selected_heading = math.atan2(selected_relative[1], selected_relative[0])
+            self.get_logger().info(
+                f"New local target: {self.committed_target.round(2)}, "
+                f"turn={np.rad2deg(selected_heading):.0f} deg")
 
-                # Visted-Location Penalty 
-                target_world = self.pose[:2] + rotation @ gap['target']
-                history = np.array(self.visited_positions)
-                differences = history - target_world
-                distances = np.linalg.norm(differences,axis=1)
-                nearest_visited = np.min(distances)
-                '''Implementing penalty V = max(0,1 - nereast_visited/Radius visited)'''
-                visited_penalty = max(0.0,1.0-nearest_visited/self.visit_radius)
-                '''Backward penalty'''
-                backward_penalty = 1.0 if gap['target'][0] < 0 else 0.0
-                gap['score'] = 0.5 * normalised_gap + 0.5 * normalised_depth - 0.3 * visited_penalty - 0.2 * backward_penalty
-            best_gap = max(self.valid_gaps,key=lambda gap : gap['score'])
-
-            target = best_gap['target']
-            # Robot frame -> World frame
-            self.committed_target = self.pose[:2] + rotation @ target
-
-        # Target selection: World frame -> Robot frame
-        target_robot_frame = rotation.T @ (
-            self.committed_target - self.pose[:2]
-        )
-        '''Target commmitment reset check'''
-        distance = np.linalg.norm(target_robot_frame)
+        target_robot = rotation.T @ (self.committed_target - self.pose[:2])
+        distance = np.linalg.norm(target_robot)
         if distance < 0.15:
-            self.committed_target = None
-            self.move_2D(0.0, 0.0, 0.0)
+            self.reset_target()
+            self.move_2D()
             return
-        '''Path commitment check'''
-        # Same idea as the collision checking along midpoint path
-        denominator = np.dot(target_robot_frame, target_robot_frame)
-        if denominator < 1e-6:
-            self.move_2D(0.0, 0.0, 0.0)
+        # Recheck the committed path on every scan, including moving obstacles.
+        blocked = False
+        if len(points_now):
+            along = points_now @ target_robot
+            t = np.clip(along / distance ** 2, 0, 1)
+            clearance = np.linalg.norm(points_now - t[:, None] * target_robot, axis=1)
+            # Points behind the start cannot obstruct translation away from them.
+            # This matches candidate generation and lets us leave a tight corner.
+            blocked = bool(np.any((along > 0) &
+                (clearance < self.robot_safe_radius + self.clearance_margin)))
+        if self.progress_distance is None or distance < self.progress_distance - 0.03:
+            self.progress_distance, self.progress_time = distance, now
+        if blocked:
+            self.blocked_since = now if self.blocked_since is None else self.blocked_since
+            self.move_2D()
+        else:
+            self.blocked_since = None
+        # Briefly wait for a moving obstacle; then reject this goal temporarily
+        # so replanning cannot immediately select the same blocked position.
+        if ((self.blocked_since is not None and now - self.blocked_since > 0.7) or
+                now - self.progress_time > 5.0):
+            self.get_logger().info("Replanning: target blocked or no distance progress")
+            self.rejected_targets.append((self.committed_target.copy(), now + 12.0))
+            self.reset_target()
+            self.move_2D()
             return
-        if self.points is None or len(self.points) == 0:
-            self.move_2D(0.0, 0.0, 0.0)
+        if blocked:
             return
-        numerator = self.points @ target_robot_frame
-        t = np.clip(numerator / denominator , 0 , 1)
-        Q = t[:, None] * target_robot_frame
-        D = np.linalg.norm((self.points - Q ), axis=1)
-        if np.min(D) < self.robot_safe_radius:
-            self.move_2D(0.0, 0.0, 0.0)
-            return
-        '''Carrot Follower'''
-        # Calculate direction
-        distance = np.linalg.norm(target_robot_frame)
-        if distance < 1e-6:
-            self.move_2D(0.0, 0.0, 0.0)
-            return
-        # unit vector
-        direction = target_robot_frame / distance
-        # Calculate carrot
-        # carrot = lookahead distance * direction
-        lookahead_distance = 0.5
-        carrot = min(lookahead_distance, distance) * direction
+        # Use the actual goal distance: a fixed-length carrot hides approach
+        # progress from the distance controller and prevents smooth slowing.
+        vx, _, turn = self.PID(self.committed_target, self.Kp, self.Kd,
+                               self.Kp_theta, self.Kd_theta)
+        # Clearance was checked along a straight segment. Driving while making
+        # a large turn follows an unchecked arc and can cut into an obstacle,
+        # causing repeated stops and new targets around the same small area.
+        # Align first, then translate along the path we actually validated.
+        heading_error = math.atan2(target_robot[1], target_robot[0])
+        if abs(heading_error) > math.radians(12):
+            vx = 0.0
+        self.move_2D(min(vx, self.navigation_speed, 0.8 * distance), 0, turn)
 
-        carrot_world = np.array(self.pose[:2]) + rotation @ carrot
-        v_final, vy , w = self.PID(carrot_world, self.Kp,self.Kd,self.Kp_theta,self.Kd_theta)
-
-        self.move_2D(v_final,0,w)
-        
-                
 
 def main(args=None):
     arg_parser = argparse.ArgumentParser(description="RB2301 final project")
@@ -451,10 +497,14 @@ def main(args=None):
     obstacle = ObstacleCourseNode(is_simulation, cli_args.calibrate)
     try:
         rclpy.spin(obstacle)
-    except SystemExit:
-        print("Shutting down")
-    obstacle.destroy_node()
-    rclpy.shutdown()
+    except (SystemExit, KeyboardInterrupt):
+        pass
+    finally:
+        # Always publish a stop before releasing the controller's publisher.
+        obstacle.move_2D()
+        obstacle.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
