@@ -1,0 +1,216 @@
+# Real-robot tuning for obstacle_course (robot 6).
+#
+# Run from ~/Downloads/rb2301_fp_max on the robot:
+#   ./fp.sh --ros-args --params-file src/rb2301_fp/params/real_robot.yaml
+# Override one value for one run by adding e.g.  -p lane_nose_gap:=0.05
+#
+# Rules: decimals need a decimal point (20.0, not 20). "whole number" settings
+# must NOT have one (12, not 12.0). After editing on the laptop: ./rsync_params.sh 6
+#
+# Robot size, measured from the LiDAR centre: front bumper 0.07 m ahead,
+# rear bumper 0.15 m behind, sides 0.11 m each way (0.22 m wide).
+#
+# Each setting: what it is [unit]
+#   ↑ = what raising it does    ↓ = what lowering it does
+
+/**:
+  ros__parameters:
+
+    # ======================= DRIVING (corridors 1 and 2) =======================
+
+    # Furthest point ahead the robot aims for in one go [m]
+    #   ↑ longer, smoother drives, fewer stops    ↓ shorter hops, more stop-and-go
+    lookahead_distance: 2.0
+
+    # Picks its next target when this close to the current one, without stopping [m]
+    #   ↑ smoother, but cuts corners more    ↓ follows each point more exactly
+    retarget_distance: 0.5
+
+    # If the next target is more than this far to the side, it stops and turns on the spot first [deg]
+    #   ↑ fewer stops to turn, but drives curves it hasn't checked    ↓ safer in tight spots, more stopping
+    align_angle_deg: 20.0
+
+    # Keeps each target this far short of the nearest box/wall [m]
+    #   ↑ fewer "Paused: path blocked" stops from sensor noise    ↓ uses more of the free space
+    target_buffer: 0.15
+
+    # How long to wait on a blocked path before choosing another one [s]
+    #   ↑ waits longer for something to move away    ↓ replans sooner
+    blocked_wait: 0.3
+
+    # Top driving speed in corridors 1 and 2 [m/s]. The steering controller stays
+    # below about 0.2 anyway, so raising this past 0.2 does nothing.
+    navigation_speed: 0.2
+
+    # Radius of the circle used as the robot's body for clearance checks [m]
+    # (the real body is 0.11 each side, so this has 3 cm spare)
+    #   ↑ keeps further from obstacles, may refuse narrow gaps    ↓ squeezes through tighter gaps, scrapes more easily
+    robot_safe_radius: 0.14
+
+    # Extra clearance required when CHOOSING a path [m]
+    #   ↑ prefers wider gaps    ↓ accepts tighter gaps
+    clearance_margin: 0.03
+
+    # Extra clearance required while already DRIVING a chosen path [m]
+    # Keep it below clearance_margin so small drift doesn't stop the robot.
+    #   ↑ stops sooner when something comes close    ↓ commits harder to its path
+    commit_margin: 0.01
+
+    # ============================= CORRIDOR TURNS ==============================
+
+    # Distance driven into a corridor before its corner can trigger [m]
+    #   ↑ ignores openings near the corridor's start    ↓ can turn earlier (risk: re-detecting the corner just turned)
+    min_corridor_travel: 0.6
+
+    # How far to the side must be empty to count as the opening to turn into [m]
+    #   ↑ ignores shallow gaps (e.g. between boxes)    ↓ also accepts shallow gaps as the turn
+    opening_side_depth: 1.1
+
+    # How wide (along the corridor) the opening must be [m]
+    #   ↑ ignores narrow gaps    ↓ turns at narrower openings
+    opening_min_width: 0.4
+
+    # ================================== GATE ===================================
+
+    # Gaps in the corridor 2 left wall within this width range count as the gate [m]
+    # Real gate ≈ 0.46. Narrow the range to stop it picking the wrong gap.
+    gate_min_width: 0.38
+    gate_max_width: 0.80
+
+    # In corridor 2, how far to the left must be empty to count as a side opening [m]
+    # (the gate detector decides the turn there, so this rarely matters)
+    gate_side_depth: 1.8
+
+    # How far to the side the gate's wall may be from the robot [m]
+    #   ↑ finds a gate further away    ↓ only looks close by
+    gate_max_lateral: 2.2
+
+    # LiDAR points needed in a 5 cm band to count as a wall line [whole number]
+    #   ↑ ignores sparse clutter    ↓ sees faint/short walls (try 8 if "lines=[]" in the log)
+    gate_line_points: 12
+
+    # Lines up this far in front of the gate before driving through [m]
+    # (shrinks automatically if the corridor is too narrow)
+    #   ↑ longer straight run-in    ↓ lines up closer to the gate
+    gate_standoff: 0.45
+
+    # Stops this far past the gate line after crossing (LiDAR position) [m]
+    # The rear is 0.15 behind the LiDAR, so 0.18 puts the whole robot through.
+    #   ↑ further into corridor 3 (closer to the first moving obstacle)    ↓ stops sooner (rear may still be in the gate)
+    gate_exit: 0.18
+
+    # How close to the line-up point before crossing starts [m]
+    #   ↑ starts crossing sooner but less centred    ↓ more centred (too small: motors creep, "no progress")
+    gate_arrive: 0.03
+
+    # Body half-width used for the "is the gate clear?" check while crossing [m]
+    #   ↑ more careful, may refuse the gate    ↓ trusts the line-up more (0.11 = the real body, no spare)
+    gate_cross_radius: 0.13
+
+    # Only drives through the gate when within this angle of straight [deg]
+    #   ↑ drives through sooner, corners may clip the edges    ↓ straighter crossing, more turning first
+    gate_align_deg: 5.0
+
+    # =========================== MOVING OBSTACLES ==============================
+
+    # How long to stand still and watch for moving obstacles [s]
+    #   ↑ surer which thing is moving (covers more of the swing)    ↓ quicker, may miss a slow swing
+    look_time: 3.0
+
+    # A moving obstacle must show up in at least this many of the scans watched [whole number]
+    # (the LiDAR gives ~6.7 scans per second)
+    #   ↑ ignores more flicker    ↓ accepts brief glimpses
+    lane_min_scans: 3
+
+    # ...and its points must spread at least this far sideways across the corridor [m]
+    #   ↑ ignores more box flicker    ↓ accepts obstacles that barely move
+    lane_min_sweep: 0.2
+
+    # Waits with its nose this far from the moving obstacle's path [m]
+    #   ↑ safer waiting spot, longer crossing    ↓ shorter crossing, more risk of being clipped
+    lane_nose_gap: 0.07
+
+    # Slowest speed when moving to that waiting spot [m/s]
+    #   ↑ no stalling, may overshoot a little    ↓ gentler (too low: motors stall)
+    min_creep_speed: 0.06
+
+    # Speed when crossing in front of a moving obstacle [m/s] (limit 0.4)
+    #   ↑ through the danger zone faster    ↓ slower crossing
+    cross_speed: 0.4
+
+    # Extra width on the left of the "is the obstacle in my path?" check [m]
+    #   ↑ waits until the obstacle is further away before crossing    ↓ crosses sooner
+    cross_margin: 0.06
+
+    # WHEN TO CROSS: only while the obstacle is moving AWAY from the robot's side.
+    # The obstacle must be in the robot's path at least this long to count as "came and went" [s]
+    #   ↑ ignores longer edge flickers    ↓ reacts to brief visits
+    lane_block_time: 0.2
+
+    # ...and the path must then stay clear at least this long before crossing [s]
+    #   ↑ surer it has left, less time to cross    ↓ goes sooner
+    lane_clear_time: 0.2
+
+    # If the obstacle never reaches the robot's side: cross when it's moving away
+    # and its nearest edge is at least this far from the robot's path [m]
+    #   ↑ waits for a bigger gap    ↓ goes with a smaller gap
+    lane_clear_gap: 0.15
+
+    # A crossing ends when the robot's REAR is this far past the obstacle's path [m]
+    # (it also stops early if the nose gets within lane_nose_gap of something after the lane)
+    #   ↑ more room behind it after crossing    ↓ stops sooner (less risk of reaching the next lane)
+    cross_clear: 0.05
+
+    # true: slide sideways to the right wall before each crossing. false: turn, drive, turn back
+    use_strafe: true
+
+    # Sideways slide speed [m/s]
+    #   ↑ reaches the wall faster    ↓ gentler (too low: motors stall, "Could not reach the right wall")
+    strafe_speed: 0.15
+
+    # Stops sliding when the robot's side is this far from the right wall [m]
+    #   ↑ further from the wall    ↓ closer (too small: scrapes)
+    wall_hug_gap: 0.08
+
+    # Only used when use_strafe is false: how close the nose drives to the wall before turning back [m]
+    # -1.0 = work it out from the simulator's robot (about 0.06)
+    wall_nose_gap: -1.0
+
+    # Distance to creep forward when nothing is moving, before looking again [m]
+    #   ↑ covers ground faster    ↓ looks more often
+    advance_step: 0.4
+
+    # Moving-obstacle lanes to cross before it's allowed to finish [whole number]
+    lanes_required: 2
+
+    # Finishes when nothing is moving and a wall is this close to the nose [m]
+    #   ↑ stops further from the end wall    ↓ drives closer to the end wall
+    end_stop_gap: 0.3
+
+    # =============================== ROBOT BODY ================================
+
+    # LiDAR centre to front bumper [m]: every "nose" distance uses this
+    body_front: 0.07
+
+    # LiDAR centre to rear bumper [m]: used when backing up
+    body_rear: 0.15
+
+    # true only if "forward" commands make the robot drive backwards (tested: not needed)
+    invert_linear: false
+
+    # LiDAR mounting: confirmed correct with --calibrate. Don't change.
+    lidar_yaw_deg: 180.0
+    lidar_x_offset: 0.0
+
+    # =============================== START FRAME ===============================
+
+    # At startup, measure the walls and make 0 deg point straight down corridor 1
+    align_start: true
+
+    # Skip that correction if the walls look more than this far off the robot heading [deg]
+    # (place the robot within ~20 deg of straight)
+    start_align_max_deg: 30.0
+
+    # Corridor to start in [whole number: 1, 2 or 3]. Use 3 to test only the moving obstacles
+    # (start just past the gate, facing down corridor 3).
+    start_corridor: 1

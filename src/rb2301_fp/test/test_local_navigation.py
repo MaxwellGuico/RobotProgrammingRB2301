@@ -13,7 +13,7 @@ class LocalNavigationTests(unittest.TestCase):
         node = SimpleNamespace(lidar_min_distance=0.0, lidar_max_distance=5.0,
                                robot_safe_radius=0.14, clearance_margin=.03, commit_margin=.01, nose_overhang=.04,
                                lidar_x_offset=offset,
-                               lidar_yaw=math.pi, pose=None)
+                               lidar_yaw=math.pi, pose=None, lookahead_distance=1.0)
         scan = SimpleNamespace(ranges=ranges, angle_min=-math.pi,
                                angle_increment=2 * math.pi / len(ranges),
                                range_min=0.05, range_max=10.0)
@@ -63,6 +63,8 @@ class LocalNavigationTests(unittest.TestCase):
             rejected_targets=[], committed_target=np.array([1., 0.]),
             points=np.asarray(points), robot_safe_radius=.14, clearance_margin=.03, commit_margin=.01,
             nose_overhang=.04, reverse_penalty_weight=1.5,
+            retarget_distance=.15, align_angle=math.radians(12),
+            start_aligned=True, align_scan_time=None,
             progress_distance=1., progress_time=11., blocked_since=None,
             navigation_speed=.35, Kp=3., Kd=0., Kp_theta=2., Kd_theta=.15,
             PID=lambda *args: (.1, 0., 0.),
@@ -74,7 +76,7 @@ class LocalNavigationTests(unittest.TestCase):
         node.state_index, node.gate, node.gate_phase = 0, None, None
         for name in ('reset_target', 'step_corridor_state', 'step_gate_detection',
                      'step_gate_approach', 'step_drive', 'gate_waypoint', 'path_is_clear',
-                     'in_gate_corridor', 'step_dynamic_obstacles'):
+                     'in_gate_corridor', 'step_dynamic_obstacles', 'log_stop', 'blocked_message'):
             setattr(node, name, MethodType(getattr(ObstacleCourseNode, name), node))
         node.update_corridor_state = lambda *args: False
         node.update_wall_direction = lambda *args: None  # tests set directions themselves
@@ -177,6 +179,7 @@ class LocalNavigationTests(unittest.TestCase):
     def corridor_node(self, index=0, pose=(0., 0., 0.)):
         node = SimpleNamespace(pose=np.array(pose), side_depth=1.1, opening_min_width=.4,
             min_corridor_travel=.8, gate_phase=None,
+            gate_max_lateral=2.2, gate_line_points=12, gate_debug={},
             state_start=np.zeros(2), side_wall_seen=False, transition_since=None,
             get_logger=lambda: SimpleNamespace(info=lambda msg: None))
         node.corridors = [dict(name='C1', direction=np.array([1., 0.]), turn='right',
@@ -445,6 +448,33 @@ class LocalNavigationTests(unittest.TestCase):
             ObstacleCourseNode.optitrack_callback(node, self.pose_msg(2., 3., 90.))
         np.testing.assert_allclose(node.pose, [0., 0., 0.], atol=1e-9)
         np.testing.assert_allclose(node.maze_pose, [2., 3., 90.], atol=1e-9)
+    def test_odom_yaw_is_only_offset(self):
+        # Start frame = fixed offset: heading changes match odom exactly.
+        node = SimpleNamespace(zero_at_start=True, zero_start_heading=True, start_pose=None,
+                               start_yaw_offset=7.0,
+                               get_logger=lambda: SimpleNamespace(info=lambda m: None))
+        from rb2301_fp.obstacle_course import to_start_frame
+        start = to_start_frame(node, 1.0, 2.0, 30.0, 'odom')
+        np.testing.assert_allclose(start, [0., 0., -7.], atol=1e-9)
+        for odom_yaw in (45.0, -60.0, 170.0):
+            pose = to_start_frame(node, 1.0, 2.0, odom_yaw, 'odom')
+            change = (pose[2] - start[2] + 180) % 360 - 180
+            self.assertAlmostEqual(change, (odom_yaw - 30.0 + 180) % 360 - 180)
+        # Driving along corridor 1 (odom 30 + 7 deg) is pure +x.
+        d = np.array([math.cos(math.radians(37)), math.sin(math.radians(37))])
+        pose = to_start_frame(node, 1.0 + d[0], 2.0 + d[1], 37.0, 'odom')
+        np.testing.assert_allclose(pose, [1., 0., 0.], atol=1e-9)
+
+    def test_wall_angle_measures_skew(self):
+        from rb2301_fp.obstacle_course import wall_angle
+        t = np.linspace(-1.0, 1.0, 40)
+        a = math.radians(8)
+        wall = np.column_stack((t * math.cos(a) - 0.5 * math.sin(a),
+                                t * math.sin(a) + 0.5 * math.cos(a)))
+        angle, length = wall_angle(wall)
+        self.assertAlmostEqual(angle, 8.0, places=3)
+        self.assertGreater(length, 1.0)
+
     def dyn_node(self):
         node = SimpleNamespace(cross_margin=.06, BODY_HALF_WIDTH=.11, BODY_FRONT=.18,
                                BODY_REAR=.034, pose=np.zeros(3))
@@ -467,6 +497,64 @@ class LocalNavigationTests(unittest.TestCase):
         far = np.column_stack((np.full(8, 1.4), np.linspace(.3, .6, 8)))
         lane = ObstacleCourseNode.lane_ahead(node, np.vstack((near, far)))
         self.assertAlmostEqual(lane['s'], .8)
+
+    def test_box_flicker_is_not_a_lane(self):
+        # A static box edge 0.4 m ahead flickers in every scan at one spot; the
+        # real obstacle 0.9 m ahead sweeps sideways. The sweep is the lane.
+        node = self.dyn_node()
+        scans, ids = [], []
+        for i in range(5):
+            flicker = np.array([[.40, .05], [.41, .06], [.42, .05]])
+            sweep = np.column_stack((np.full(4, .9), np.linspace(-.4, .2, 4) + .1 * i))
+            scans.append(np.vstack((flicker, sweep)))
+            ids += [i] * 7
+        lane = ObstacleCourseNode.lane_ahead(node, np.vstack(scans), np.array(ids))
+        self.assertAlmostEqual(lane['s'], .9)
+
+    def observe_node(self):
+        logs, phases = [], []
+        node = SimpleNamespace(cross_margin=.06, BODY_HALF_WIDTH=.11, BODY_FRONT=.07,
+                               BODY_REAR=.15, pose=np.zeros(3), Kp_theta=2.,
+                               gate_phase=None, dyn_phase='observe', dyn_since=0.,
+                               lanes_crossed=0, lanes_required=2, last_scan_time=0.,
+                               move_2D=lambda *a: None,
+                               get_logger=lambda: SimpleNamespace(info=logs.append))
+        node.corridors = [dict(name='C3', direction=np.array([1., 0.]), turn=None)]
+        node.state_index = 0
+        node.lane = dict(s=.30, thick=.05, was_blocked=False, clear_since=None)
+        for name in ('corridor_axes', 'strip_blocked', 'heading_error_to', 'set_dyn_phase',
+                     'step_dynamic_obstacles'):
+            setattr(node, name, MethodType(getattr(ObstacleCourseNode, name), node))
+        return node, logs
+
+    def run_observe(self, node, t, edge_y):
+        """One scan at time t with the obstacle's near edge at lateral edge_y."""
+        node.last_scan_time = t
+        ys = np.linspace(edge_y, edge_y + .3, 8)
+        pts = np.column_stack((np.full(8, .30), ys))
+        frame = SimpleNamespace(now=t, points_now=pts, rotation=np.eye(2))
+        with patch('rb2301_fp.obstacle_course.time.monotonic', lambda: t):
+            node.step_dynamic_obstacles(frame)
+        return node.dyn_phase
+
+    def test_approaching_flicker_does_not_trigger_crossing(self):
+        node, _ = self.observe_node()
+        t = 0.
+        # Approaching: edge moves toward our path, flickering in for one scan.
+        for edge in (.6, .5, .4, .3, .10, .25, .2, .19):
+            t += .15
+            self.assertEqual(self.run_observe(node, t, edge), 'observe', f"crossed at edge {edge}")
+
+    def test_crosses_when_obstacle_leaves_moving_away(self):
+        node, logs = self.observe_node()
+        t = 0.
+        for edge in (.4, .25, .10, .0, -.1, -.1, .0, .10, .20, .30, .40, .50):
+            t += .15
+            phase = self.run_observe(node, t, edge)
+            if phase == 'cross':
+                break
+        self.assertEqual(phase, 'cross')
+        self.assertTrue(any('moving away' in m for m in logs))
 
     def test_stray_points_do_not_hide_lane(self):
         node = self.dyn_node()
