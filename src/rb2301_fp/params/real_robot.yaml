@@ -62,6 +62,15 @@
     #   ↑ ignores openings near the corridor's start    ↓ can turn earlier (risk: re-detecting the corner just turned)
     min_corridor_travel: 0.6
 
+    # Corridor 1: after this far, paths toward the right-hand opening get a bonus [m]
+    # (cans make that opening look small, so the planner kept going straight on)
+    #   ↑ starts favouring the right later    ↓ starts earlier (too small: cuts the corner)
+    turn_bias_after: 0.5
+
+    # Size of that bonus, per metre the path goes to the right [score]
+    #   ↑ turns right more eagerly    ↓ weaker preference (0 = off)
+    turn_bias_weight: 1.5
+
     # How far to the side must be empty to count as the opening to turn into [m]
     #   ↑ ignores shallow gaps (e.g. between boxes)    ↓ also accepts shallow gaps as the turn
     opening_side_depth: 1.1
@@ -89,10 +98,27 @@
     #   ↑ ignores sparse clutter    ↓ sees faint/short walls (try 8 if "lines=[]" in the log)
     gate_line_points: 12
 
+    # When a new opening appears on the left, stop up to this long and look for the
+    # moving obstacle behind it [s]. Motion seen through the opening confirms the gate
+    # at once; no motion falls back to the 3-of-5-scan check. 0 = never stop to look.
+    #   ↑ more time to catch a slow swing    ↓ shorter stops (too small: misses the swing)
+    gate_look_time: 3.0
+
+    # No opening found yet: every this far along corridor 2, stop (gate_look_time) and
+    # look for the moving obstacle THROUGH the left wall. It can only be seen through
+    # the gate, so motion there places the gate. 0 = never stop for this [m]
+    #   ↑ fewer stops (may drive past the gate)    ↓ looks more often (slower)
+    gate_motion_step: 0.4
+
     # Lines up this far in front of the gate before driving through [m]
     # (shrinks automatically if the corridor is too narrow)
     #   ↑ longer straight run-in    ↓ lines up closer to the gate
     gate_standoff: 0.45
+
+    # Within this distance of the line-up point, face the gate square and slide
+    # (strafe + forward/back) onto the point instead of turning toward it [m]
+    #   ↑ starts sliding further out    ↓ only the last bit is a slide
+    gate_strafe_range: 0.6
 
     # Stops this far past the gate line after crossing (LiDAR position) [m]
     # The rear is 0.15 behind the LiDAR, so 0.18 puts the whole robot through.
@@ -156,25 +182,30 @@
     #   ↑ waits for a bigger gap    ↓ goes with a smaller gap
     lane_clear_gap: 0.15
 
+    # Before crossing, watch the swing until it has turned around twice (to learn its period
+    # and size), but at most this long. Then it crosses right as the obstacle turns back [s]
+    #   ↑ more patient with irregular obstacles    ↓ falls back to the simpler rules sooner
+    swing_learn_time: 6.0
+
+    # Start crossing while the obstacle is still leaving, if it will be clear of the path
+    # by the time the nose reaches the lane (this many seconds after starting) [s]
+    #   ↑ more cautious start (waits until it is further out)    ↓ starts sooner
+    lane_reach_time: 0.35
+
     # A crossing ends when the robot's REAR is this far past the obstacle's path [m]
     # (it also stops early if the nose gets within lane_nose_gap of something after the lane)
     #   ↑ more room behind it after crossing    ↓ stops sooner (less risk of reaching the next lane)
-    cross_clear: 0.05
-
-    # true: slide sideways to the right wall before each crossing. false: turn, drive, turn back
-    use_strafe: true
+    cross_clear: 0.15
 
     # Sideways slide speed [m/s]
     #   ↑ reaches the wall faster    ↓ gentler (too low: motors stall, "Could not reach the right wall")
     strafe_speed: 0.15
 
-    # Stops sliding when the robot's side is this far from the right wall [m]
+    # Stops sliding when the robot's side is about this far + 2 cm from the right wall [m]
+    # (0.08 -> ~10 cm. Not much closer: a crooked wall then angles into the path ahead and
+    #  the robot thinks its way is blocked forever)
     #   ↑ further from the wall    ↓ closer (too small: scrapes)
     wall_hug_gap: 0.08
-
-    # Only used when use_strafe is false: how close the nose drives to the wall before turning back [m]
-    # -1.0 = work it out from the simulator's robot (about 0.06)
-    wall_nose_gap: -1.0
 
     # Distance to creep forward when nothing is moving, before looking again [m]
     #   ↑ covers ground faster    ↓ looks more often
@@ -195,17 +226,25 @@
     # LiDAR centre to rear bumper [m]: used when backing up
     body_rear: 0.15
 
-    # true only if "forward" commands make the robot drive backwards (tested: not needed)
-    invert_linear: false
-
     # LiDAR mounting: confirmed correct with --calibrate. Don't change.
     lidar_yaw_deg: 180.0
     lidar_x_offset: 0.0
 
+    # Turning on the spot pivots about this point, measured forward from the LiDAR [m]
+    # (mecanum: middle of the wheels, ~4 cm behind the LiDAR). Used to check the
+    # corners won't swing into anything; if they would, it slides away first.
+    turn_centre_x: -0.04
+
+    # Extra clearance kept around the swept body when turning on the spot [m]
+    turn_margin: 0.03
+
     # =============================== START FRAME ===============================
 
     # At startup, measure the walls and make 0 deg point straight down corridor 1
-    align_start: true
+    # Off: the robot is always placed straight down corridor 1, and on the real course the
+    # wall reading was 14 deg wrong (2026-11-13), which skewed corridor 2 and the gate search.
+    # With it off, 0 deg = the way the robot faces at the start.
+    align_start: false
 
     # Skip that correction if the walls look more than this far off the robot heading [deg]
     # (place the robot within ~20 deg of straight)

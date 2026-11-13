@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'obstacle_course = rb2301_fp.obstacle_course:main',
+            'obstacle_avoidance_lidar = rb2301_fp.obstacle_avoidance_lidar:main',
         ],
     },
 )

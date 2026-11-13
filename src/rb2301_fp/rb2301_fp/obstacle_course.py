@@ -33,15 +33,8 @@ def optitrack_to_maze(x:float, y:float, heading_deg:float, frame:dict) -> tuple:
     return (c * dx + s * dy, -s * dx + c * dy,
             wrap_deg(heading_deg - frame["rotation_deg"] - frame["heading_offset_deg"]))
 
-def maze_to_course(x:float, y:float, heading_deg:float, course:dict) -> tuple:
-    '''CA2 maze-frame pose -> final-project course frame (origin/rotation of the course in the maze frame, [course] in the config).'''
-    dx, dy = x - course["origin_x"], y - course["origin_y"]
-    r = math.radians(course["rotation_deg"])
-    c, s = math.cos(r), math.sin(r)
-    return (c * dx + s * dy, -s * dx + c * dy, wrap_deg(heading_deg - course["rotation_deg"]))
-
 def load_frame(robot_number:int) -> tuple:
-    '''Read optitrack_variables.config: returns (frame, course) for this robot.'''
+    '''Read optitrack_variables.config: the OptiTrack -> maze frame for this robot.'''
     parser = configparser.ConfigParser()
     path = os.path.join(_PACKAGE_DIR, "optitrack_variables.config")
     if not parser.read(path):
@@ -52,8 +45,7 @@ def load_frame(robot_number:int) -> tuple:
     frame["heading_offset_deg"] = wrap_deg(-(frame["rotation_deg"] + 90.0)) if raw == "auto" else float(raw)
     if parser.has_section("heading_offsets") and parser.has_option("heading_offsets", str(robot_number)):
         frame["heading_offset_deg"] = parser.getfloat("heading_offsets", str(robot_number))
-    course = {k: parser.getfloat("course", k, fallback=0.0) for k in ("origin_x", "origin_y", "rotation_deg")}
-    return frame, course
+    return frame
 
 def to_start_frame(node, x, y, heading, source):
     '''Pose relative to where the robot started: that spot is (0, 0) and, with
@@ -149,13 +141,15 @@ class ObstacleCourseNode(Node):
         self.start_pose = None
         # At startup, measure the corridor walls with the LiDAR and make 0 deg
         # point straight down corridor 1, even if the robot is placed skewed.
-        self.align_start = bool(self.declare_parameter('align_start', True).value)
+        # Off by default: the robot is always placed straight, and on the real
+        # course the wall reading was 14 deg wrong (2026-11-13).
+        self.align_start = bool(self.declare_parameter('align_start', False).value)
         self.start_align_max_deg = float(self.declare_parameter(
             'start_align_max_deg', 30.0).value)
         self.start_yaw_offset = 0.0
         self.start_aligned = False
         self.align_scan_time = None
-        self.frame = self.course = None
+        self.frame = None
         self._ticks = 0
 
         if is_simulation:
@@ -175,7 +169,7 @@ class ObstacleCourseNode(Node):
             # On the Bingda robots ROS_DOMAIN_ID is the robot's number, so the Optitrack topic is picked automatically
             domain = os.environ.get("ROS_DOMAIN_ID", "")
             self.robot_number = int(domain) if domain.isdigit() and 1 <= int(domain) <= 99 else 3
-            self.frame, self.course = load_frame(self.robot_number)
+            self.frame = load_frame(self.robot_number)
             self.get_logger().info(f"Reading pose from /vrpn_mocap/bingda_{self.robot_number:03d}/pose")
 
             self.map_sub = self.create_subscription( 
@@ -186,9 +180,6 @@ class ObstacleCourseNode(Node):
                 )
             
         self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10) # Publish to cmd_vel node
-        # True if the base moves toward the robot's rear (the side the LiDAR
-        # calls 180 deg) when sent +x. Turning is unaffected.
-        self.invert_linear = bool(self.declare_parameter('invert_linear', False).value)
         self.timer = self.create_timer(0.05, self.timer_callback)  # Runs at 20Hz. Can be changed.
 
         self.pose = None
@@ -285,6 +276,16 @@ class ObstacleCourseNode(Node):
         self.scan_history = deque()
         self.gate_scan_history_s = 1.0
         self.gate_min_width = float(self.declare_parameter('gate_min_width', 0.38).value)
+        # A new opening makes the robot stop up to this long and look for the moving
+        # obstacle behind it: motion seen through the opening confirms the gate at
+        # once. No motion: fall back to the 3-of-5-scan rule. 0 turns the look off.
+        self.gate_look_time = float(self.declare_parameter('gate_look_time', 3.0).value)
+        self.gate_look, self.gate_looked = None, []  # current look; openings already looked at
+        # No opening found yet: every this far along corridor 2, stop for
+        # gate_look_time and look for the moving obstacle THROUGH the left wall
+        # (it can only be seen through the gate). 0 turns these stops off.
+        self.gate_motion_step = float(self.declare_parameter('gate_motion_step', 0.4).value)
+        self.next_motion_look = 0.2
         self.gate_max_width = float(self.declare_parameter('gate_max_width', 0.80).value)
         self.gate_standoff = float(self.declare_parameter('gate_standoff', 0.45).value)
         self.gate_exit = float(self.declare_parameter('gate_exit', 0.12).value)
@@ -313,6 +314,14 @@ class ObstacleCourseNode(Node):
         self.look_time = float(self.declare_parameter('look_time', 1.5).value)
         self.wall_hug_gap = float(self.declare_parameter('wall_hug_gap', 0.08).value)
         self.strafe_speed = float(self.declare_parameter('strafe_speed', 0.15).value)
+        # Corridor 1: after this far, paths toward the right-hand opening score
+        # turn_bias_weight extra per metre to the right (cans make that opening
+        # look small, so the planner kept preferring straight on).
+        self.turn_bias_after = float(self.declare_parameter('turn_bias_after', 0.5).value)
+        self.turn_bias_weight = float(self.declare_parameter('turn_bias_weight', 1.5).value)
+        # Gate line-up: within this distance of the line-up point, face the gate
+        # square and strafe/slide onto the point instead of turning toward it.
+        self.gate_strafe_range = float(self.declare_parameter('gate_strafe_range', 0.6).value)
         self.advance_step = float(self.declare_parameter('advance_step', 0.4).value)
         # Extra sideways clearance kept from a moving obstacle while crossing.
         self.cross_margin = float(self.declare_parameter('cross_margin', 0.06).value)
@@ -324,16 +333,9 @@ class ObstacleCourseNode(Node):
         self.lane_clear_gap = float(self.declare_parameter('lane_clear_gap', 0.15).value)
         # A crossing ends when the rear is this far past the lane (m).
         self.cross_clear = float(self.declare_parameter(
-            'cross_clear', 0.15 if is_simulation else 0.05).value)
-        # Reach the right wall by sliding sideways (needs a base that can strafe)
-        # instead of turn-drive-turn. Sliding ends wall_hug_gap from the wall.
-        self.use_strafe = bool(self.declare_parameter('use_strafe', False).value)
-        # Turn-drive-turn: stop when the nose is this close to the wall.
-        # Negative = work it out from the simulated body's turning circle.
-        self.wall_nose_gap = float(self.declare_parameter('wall_nose_gap', -1.0).value)
-        # Wait with the nose this far from a moving obstacle's path
-        # (negative = old behaviour: middle of the free space).
-        self.lane_nose_gap = float(self.declare_parameter('lane_nose_gap', -1.0).value)
+            'cross_clear', 0.15).value)  # rear bumper this far past the obstacle's far face
+        # Wait with the nose this far from a moving obstacle's path (m).
+        self.lane_nose_gap = float(self.declare_parameter('lane_nose_gap', 0.07).value)
         # Distance from the LiDAR centre to the front bumper (m). Used for every
         # "nose" distance; the default fits the simulated robot.
         self.BODY_FRONT = float(self.declare_parameter('body_front', 0.18).value)
@@ -342,6 +344,16 @@ class ObstacleCourseNode(Node):
         # A lane must show motion in this many look scans and sweep this far
         # sideways (m); flicker on a static box does neither.
         self.lane_min_scans = int(self.declare_parameter('lane_min_scans', 3).value)
+        # Turning on the spot: the point it pivots about, measured forward from
+        # the pose (sim: rear axle = 0; real mecanum: wheel centre, ~-0.04 from
+        # the LiDAR), and the clearance kept around the swept body [m].
+        self.turn_centre_x = float(self.declare_parameter('turn_centre_x', 0.0).value)
+        self.turn_margin = float(self.declare_parameter('turn_margin', 0.03).value)
+        # Start crossing while the obstacle is still leaving, if it will be clear
+        # by the time the nose reaches the lane (this many seconds) [s].
+        self.lane_reach_time = float(self.declare_parameter('lane_reach_time', 0.35).value)
+        # Watch a swing this long at most to learn its period before crossing [s].
+        self.swing_learn_time = float(self.declare_parameter('swing_learn_time', 6.0).value)
         self.lane_min_sweep = float(self.declare_parameter('lane_min_sweep', 0.2).value)
         # Slowest speed (m/s) for short positioning moves near a lane.
         self.min_creep_speed = float(self.declare_parameter(
@@ -472,11 +484,6 @@ class ObstacleCourseNode(Node):
         self.pose = to_start_frame(self, x, y, heading, 'OptiTrack maze frame')
         return self.pose
 
-    def to_course(self, pose=None):
-        '''Convert a pose [x, y, heading] (default: self.pose) from the CA2 maze frame to the final-project course frame. Optional; see [course] in optitrack_variables.config'''
-        pose = self.pose if pose is None else pose
-        return np.array(maze_to_course(pose[0], pose[1], pose[2], self.course)) if self.course else np.array(pose)
-
     def odometer_callback(self, msg):
         '''Callback to calculate 2D pose info from Gazebo odomoter. Pose info includes x and y coordinates, as well as heading in degrees.
         This callback will run everytime the rclpy executor spins'''
@@ -493,59 +500,35 @@ class ObstacleCourseNode(Node):
     def move_2D(self, x:float=0.0, y:float=0.0, turn:float=0.0):
         '''Publishes a Twist message to ROS to move a robot. Inputs are x and y linear velocities, as well as turn (z-axis yaw) angular velocity.'''
         twist_msg = Twist()
-        if getattr(self, 'invert_linear', False):
-            # Base drives toward the robot's rear for +x: flip forward/sideways.
-            x, y = -x, -y
         x = np.clip(x, -self.max_translate_velocity, self.max_translate_velocity)
         y = np.clip(y, -self.max_translate_velocity, self.max_translate_velocity)
         turn = np.clip(turn, -self.max_translate_velocity*2, self.max_translate_velocity*2)
         twist_msg.linear.x, twist_msg.linear.y, twist_msg.linear.z = float(x), float(y), 0.0
         twist_msg.angular.x, twist_msg.angular.y, twist_msg.angular.z = 0.0, 0.0, float(turn)
         self.publisher_.publish(twist_msg)
-    def current_xy_error(self,goal):
-        '''Calculate Current Error'''
-        robot_point = (self.pose[0],self.pose[1])
-        '''Calculate Current Error'''
-        e_x_current = goal[0]-robot_point[0]
-        e_y_current = goal[1]-robot_point[1]
-        return e_x_current, e_y_current
-    def PID(self, goal:tuple, Kp, Kd, Kp_theta, Kd_theta):
-        e_x_current , e_y_current = self.current_xy_error(goal)
-        error_distance = math.sqrt(e_x_current*e_x_current + e_y_current*e_y_current)
-        desired_heading = np.arctan2(e_y_current,e_x_current)
-        current_heading = np.deg2rad(self.pose[2])
-        error_heading =   desired_heading - current_heading
-        error_heading = np.arctan2(
-            np.sin(error_heading),
-            np.cos(error_heading),
-
-        )
-        '''Clock for dt'''
-        current_time = self.get_clock().now() # use only one, this works in nanoseconds so if i call again it will be a different timestamp
-        dt = current_time - self.PID_prev_time
-        if self.error_distance_prev is None and self.error_heading_prev is None:
-            self.error_distance_prev = error_distance
-            self.error_heading_prev = error_heading
-        Vx = Kp*(error_distance) + Kd * ((error_distance-self.error_distance_prev)/((dt.nanoseconds/1e9)))\
-            if (dt.nanoseconds/1e9) > 1e-9 else Kp*(error_distance)
-        Vx = np.clip(Vx, 0.0, self.max_translate_velocity)
-        Vx *= max(0.0, 0.5 * np.cos(error_heading)) # Slows down during turning
-        Vy = 0
+    def PID(self, goal, Kp, Kd, Kp_theta, Kd_theta):
+        """Forward speed and turn rate toward goal. Forward speed is halved and
+        scaled by cos(heading error) so the robot slows while turning."""
+        dx, dy = goal[0] - self.pose[0], goal[1] - self.pose[1]
+        error_distance = math.hypot(dx, dy)
+        error_heading = math.atan2(dy, dx) - math.radians(self.pose[2])
+        error_heading = math.atan2(math.sin(error_heading), math.cos(error_heading))
+        now = self.get_clock().now()
+        dt = (now - self.PID_prev_time).nanoseconds / 1e9
+        if self.error_distance_prev is None:
+            self.error_distance_prev, self.error_heading_prev = error_distance, error_heading
+        vx = Kp * error_distance
+        if dt > 1e-9:
+            vx += Kd * (error_distance - self.error_distance_prev) / dt
+        vx = np.clip(vx, 0.0, self.max_translate_velocity) * max(0.0, 0.5 * math.cos(error_heading))
         # Wrap the derivative too: crossing +/-pi is not a 2*pi heading jump.
-        heading_delta = math.atan2(math.sin(error_heading-self.error_heading_prev),
-                                   math.cos(error_heading-self.error_heading_prev))
-        w =  Kp_theta * error_heading + Kd_theta* (heading_delta/((dt.nanoseconds/1e9))) \
-                   if (dt.nanoseconds/1e9) > 1e-9 else Kp_theta *(error_heading)
+        delta = math.atan2(math.sin(error_heading - self.error_heading_prev),
+                           math.cos(error_heading - self.error_heading_prev))
+        w = Kp_theta * error_heading + (Kd_theta * delta / dt if dt > 1e-9 else 0.0)
+        self.error_distance_prev, self.error_heading_prev, self.PID_prev_time = (
+            error_distance, error_heading, now)
+        return vx, 0, w
 
-        self.get_logger().debug(f"Error Distance: {error_distance} Turning Correction Applied: {max(0.0, np.cos(error_heading))} Vx: {Vx}")
-        self.get_logger().debug(f"Desired Heading: {desired_heading} Current Heading: {current_heading} Error Heading: {error_heading} Angular z: {w}")
-        '''Save prev errors and prev PID time'''
-
-        self.error_distance_prev = error_distance
-        self.error_heading_prev = error_heading
-        self.PID_prev_time = current_time
-
-        return Vx, Vy,w
     def enter_corridor(self, index):
         """Switch corridor: new forward direction, fresh opening detection."""
         self.state_index = index
@@ -554,6 +537,7 @@ class ObstacleCourseNode(Node):
         self.side_wall_seen = False
         self.transition_since = None
         self.state_start = None if self.pose is None else self.pose[:2].copy()
+        self.next_motion_look = 0.2  # first motion look this far into the corridor
         self.get_logger().info(
             f"State -> {corridor['name']}: forward={corridor['direction'].round(2)}, "
             f"next opening on the {corridor['turn'] or 'n/a'}")
@@ -738,6 +722,20 @@ class ObstacleCourseNode(Node):
             positions = np.sort(along[np.abs(lateral - line) < 0.05])
             coverage = 0.05 * len(np.unique(np.floor(positions / 0.05)))
             lines.append((line, positions, coverage))
+        # A crooked cardboard wall spreads over neighbouring 5 cm bins and was
+        # split into several short lines (none long enough): merge lines that
+        # are under 8 cm apart sideways into one.
+        merged = []
+        for line, positions, coverage in sorted(lines, key=lambda l: l[0]):
+            if merged and line - merged[-1][0] < 0.08:
+                last_line, last_positions, _ = merged[-1]
+                both = np.sort(np.concatenate([last_positions, positions]))
+                mean_line = ((last_line * len(last_positions) + line * len(positions))
+                             / max(1, len(both)))
+                merged[-1] = (mean_line, both, 0.05 * len(np.unique(np.floor(both / 0.05))))
+            else:
+                merged.append((line, positions, coverage))
+        lines = merged
         # The gate is in the corridor's OUTER wall: the furthest long line on
         # this side. Box and bin faces sit inside the corridor, nearer than it,
         # and can otherwise pair up into a fake "gate".
@@ -948,7 +946,7 @@ class ObstacleCourseNode(Node):
 
         self.update_wall_direction(world_points)  # follow walls up to ~10 deg off square
         self.step_corridor_state(frame)    # Corridor turns (state machine)
-        self.step_gate_detection(frame)    # 2. Find + confirm the gate (logs only)
+        if self.step_gate_detection(frame): return  # 2. Find + confirm the gate (stops to look for motion behind openings)
         self.step_gate_approach(frame)     # 2b. Drive to and through the confirmed gate
         if self.step_dynamic_obstacles(frame): return  # 3. Stop, observe, cross
         self.step_drive(frame)             # 1. Obstacle-avoiding local controller
@@ -994,9 +992,130 @@ class ObstacleCourseNode(Node):
             self.reset_target()
 
     def step_gate_detection(self, frame):
-        """In corridor 2, look for the gate each scan; confirm over several scans."""
-        if self.in_gate_corridor() and self.gate_phase is None:
-            self.update_gate_detection(frame.world_points)
+        """In corridor 2, look for the gate each scan; confirm over several scans,
+        or at once if the moving obstacle is seen through a new opening.
+        Returns True while stopped to look (the drive step must not run)."""
+        if not (self.in_gate_corridor() and self.gate_phase is None and self.gate is None):
+            return False
+        if self.gate_look is not None:
+            return self.step_gate_look(frame.now)
+        if self.update_gate_detection(frame.world_points) or self.gate_look_time <= 0:
+            return False
+        newest = self.gate_candidates_history[-1] if self.gate_candidates_history else []
+        fresh = [c for c in newest
+                 if all(np.linalg.norm(c['centre'] - seen) > 0.15 for seen in self.gate_looked)]
+        if not fresh:
+            return self.start_motion_look(frame.now)
+        self.gate_looked += [c['centre'].copy() for c in fresh]
+        self.gate_look = dict(candidates=fresh, since=frame.now, scans=set(), hits={})
+        self.move_2D()
+        self.get_logger().info(
+            f"Gate: possible opening at {[c['centre'].round(2).tolist() for c in fresh]} "
+            f"(width {[round(c['width'], 2) for c in fresh]} m); stopping up to "
+            f"{self.gate_look_time:.1f} s to look for motion behind it")
+        return True
+
+    def start_motion_look(self, now):
+        '''No opening found: every gate_motion_step m along corridor 2, stop and
+        look for the moving obstacle through the left wall line.'''
+        if self.gate_motion_step <= 0 or self.state_start is None:
+            return False
+        travelled = float((self.pose[:2] - self.state_start) @ self.progress_direction)
+        if travelled < self.next_motion_look:
+            return False
+        self.next_motion_look = travelled + self.gate_motion_step
+        debug = getattr(self, 'gate_debug', {})
+        lines, outer = debug.get('lines') or [], debug.get('outer')
+        # The wall the gate is in: the outer line if known, else the longest line.
+        wall = outer if outer is not None else (max(lines, key=lambda l: l[1])[0] if lines else None)
+        if wall is None:
+            return False
+        self.gate_look = dict(candidates=[], wall=float(wall), since=now, scans=set(), hits={},
+                              crossings=[])
+        self.move_2D()
+        self.get_logger().info(
+            f"Gate: no opening found yet ({travelled:.2f} m into corridor 2); stopping up to "
+            f"{self.gate_look_time:.1f} s to look for the moving obstacle through the left "
+            f"wall ({wall:.2f} m to the side)")
+        return True
+
+    def motion_through_wall(self, dyn, wall):
+        '''Where (m along the corridor from the robot) the rays to moving points
+        BEYOND the wall line cross that line: those rays pass through the gate.'''
+        if not len(dyn) or not self.scan_history:
+            return np.empty(0)
+        _, forward, _, side = self.corridor_axes()
+        rel, origin = dyn - self.pose[:2], self.scan_history[-1]['xy'] - self.pose[:2]
+        along, lateral = rel @ forward, rel @ side
+        o_along, o_lateral = float(origin @ forward), float(origin @ side)
+        beyond = (lateral > wall + 0.05) & (lateral < wall + 1.5) & (along > -0.6) & (along < 2.5)
+        s = (wall - o_lateral) / (lateral[beyond] - o_lateral)
+        return o_along + s * (along[beyond] - o_along)
+
+    def gate_motion_behind(self, candidate, dyn):
+        '''How many moving points lie BEHIND the opening's wall line and are seen
+        THROUGH the opening (the ray from the LiDAR crosses the gap itself).'''
+        if not len(dyn) or not self.scan_history:
+            return 0
+        origin, n = self.scan_history[-1]['xy'], candidate['normal']
+        along_wall = np.array((-n[1], n[0]))
+        behind = (dyn - candidate['centre']) @ n
+        ray = dyn - origin
+        denom = ray @ n
+        ok = (behind > 0.03) & (behind < 1.5) & (np.abs(denom) > 1e-6)
+        s = ((candidate['centre'] - origin) @ n) / np.where(ok, denom, 1.0)
+        at_wall = origin + s[:, None] * ray  # where each ray crosses the wall line
+        through = np.abs((at_wall - candidate['centre']) @ along_wall) < 0.5 * candidate['width']
+        return int(np.count_nonzero(ok & through & (s > 0) & (s < 1)))
+
+    def step_gate_look(self, now):
+        '''Stand still and compare scans: motion behind an opening (in 2 scans)
+        confirms it as the gate; after gate_look_time without motion, carry on.'''
+        look = self.gate_look
+        self.move_2D()
+        if self.last_scan_time not in look['scans']:
+            look['scans'].add(self.last_scan_time)
+            dyn = self.dynamic_points(since=look['since'] + 0.3)  # let the robot settle first
+            if not look['candidates']:
+                crossings = self.motion_through_wall(dyn, look['wall'])
+                if len(crossings) >= 2:
+                    look['crossings'].append(crossings)
+                    look['hits'][0] = look['hits'].get(0, 0) + 1
+            for i, candidate in enumerate(look['candidates']):
+                if self.gate_motion_behind(candidate, dyn) >= 2:
+                    look['hits'][i] = look['hits'].get(i, 0) + 1
+        best = max(look['hits'], key=look['hits'].get, default=None)
+        if not look['candidates'] and best is not None and look['hits'][best] >= 2:
+            # Gate = where the rays to the moving obstacle crossed the wall line.
+            crossings = np.concatenate(look['crossings'])
+            _, forward, _, side = self.corridor_axes()
+            centre_along = float(np.median(crossings))
+            width = float(np.clip(np.ptp(crossings) + 0.1, self.gate_min_width, self.gate_max_width))
+            self.gate = dict(centre=self.pose[:2] + forward * centre_along + side * look['wall'],
+                             normal=side.copy(), width=width)
+            self.gate_look = None
+            self.get_logger().info(
+                f"Gate confirmed: centre={self.gate['centre'].round(2)}, width~{width:.2f} m "
+                f"(moving obstacle seen through the left wall in {look['hits'][best]} scans, "
+                f"{centre_along:+.2f} m along from the robot)")
+            return False
+        if best is not None and look['candidates'] and look['hits'][best] >= 2:
+            c = look['candidates'][best]
+            self.gate = dict(centre=c['centre'].copy(), normal=c['normal'].copy(), width=float(c['width']))
+            self.gate_look = None
+            self.get_logger().info(
+                f"Gate confirmed: centre={self.gate['centre'].round(2)}, width={self.gate['width']:.2f} m "
+                f"(motion seen behind the opening in {look['hits'][best]} scans)")
+            return False
+        if now - look['since'] > self.gate_look_time:
+            self.gate_look = None
+            self.get_logger().info(
+                f"Gate: no motion behind the opening in {self.gate_look_time:.1f} s; "
+                f"using the 3-of-5-scan check" if look['candidates'] else
+                f"Gate: no motion seen through the left wall in {self.gate_look_time:.1f} s; "
+                f"driving on {self.gate_motion_step:.1f} m")
+            return False
+        return True
 
     def step_gate_approach(self, frame):
         """Once a gate is confirmed, steer the controller to it and through it."""
@@ -1009,9 +1128,6 @@ class ObstacleCourseNode(Node):
     # ---------------- 3. Moving obstacles: stop, observe, cross ----------------
     # Robot body relative to base_link (rear axle), from the URDF meshes.
     BODY_REAR, BODY_FRONT, BODY_HALF_WIDTH = 0.034, 0.18, 0.11
-    # Turning on the spot (about the rear axle in Gazebo) swings the front
-    # corners out to this radius.
-    TURN_RADIUS = math.hypot(0.18, 0.11)
 
     def dynamic_points(self, since, lag=0.4):
         """World points in the newest scan that were not there ~lag s earlier.
@@ -1064,6 +1180,54 @@ class ObstacleCourseNode(Node):
                         thick=float(np.clip(np.ptp(s_) / 2, 0.02, 0.2)))
         return None
 
+    def track_swing(self, lane):
+        """Record when the obstacle's nearest edge turns around on OUR side
+        (a local minimum), to learn its period and swing size."""
+        turns = lane.setdefault('turns', [])
+        raw = list(lane['nears'])
+        # Lifted out of view at the turnaround (a pendulum rises at the ends of
+        # its swing, above the LiDAR plane): seen -> unseen -> seen again, near
+        # our side both times. Count the middle of the gap as the turnaround.
+        if len(raw) >= 3 and math.isfinite(raw[-1][1]) and math.isinf(raw[-2][1]):
+            k = len(raw) - 2
+            while k > 0 and math.isinf(raw[k][1]):
+                k -= 1
+            gap = raw[-1][0] - raw[k][0]
+            if math.isfinite(raw[k][1]) and 0.1 < gap < 1.0:
+                t_mid = (raw[k][0] + raw[-1][0]) / 2
+                if not turns or t_mid - turns[-1][0] > 0.6:
+                    turns.append((t_mid, min(raw[k][1], raw[-1][1])))
+                return
+        hist = [(t, e) for t, e in raw if math.isfinite(e)]
+        if len(hist) < 5:
+            return
+        (t_mid, e_mid) = hist[-3]
+        window = [e for t, e in hist if abs(t - t_mid) <= 0.3]
+        # Strict minimum over +-0.3 s, and clearly rising since (not noise).
+        if e_mid <= min(window) and hist[-1][1] > e_mid + 0.02 and hist[-2][1] >= e_mid:
+            if not turns or t_mid - turns[-1][0] > 0.6:
+                turns.append((t_mid, e_mid))
+
+    def swing_turned_back(self, lane, now, left_edge):
+        """True right after the obstacle turned back at our side, if (from its
+        measured period and swing size, as a pendulum) it will have moved clear
+        of our path by the time the nose reaches the lane."""
+        turns = lane.get('turns', [])
+        if len(turns) < 2 or now - turns[-1][0] > 0.35:
+            return False
+        period = float(np.median(np.diff([t for t, _ in turns[-4:]])))
+        if not 0.8 < period < 6.0:
+            return False
+        t_turn, e_min = turns[-1]
+        recent = [e for t, e in lane['nears'] if math.isfinite(e) and now - t <= period]
+        if not recent:
+            return False
+        amplitude = (max(recent) - e_min) / 2
+        reach = getattr(self, 'lane_reach_time', 0.35)
+        dt = (now - t_turn) + reach
+        edge_then = e_min + amplitude * (1 - math.cos(2 * math.pi * min(dt / period, 0.5)))
+        return edge_then >= left_edge + 0.02
+
     def creep_speed(self, error):
         """Speed for short positioning moves: proportional, but never below
         min_creep_speed (slower than that the real motors barely move)."""
@@ -1108,10 +1272,9 @@ class ObstacleCourseNode(Node):
         """Corridor 3: look for moving obstacles, line up beside the right wall,
         wait for each to leave our path, cross. Returns True while it drives.
 
-        Phases: align -> look -> centre -> turn_right -> to_wall -> align
-                -> observe -> cross (repeat per lane), or look -> advance /
-                finished. A pocket too shallow to turn in uses 'shift'
-                (slide sideways) instead of turn_right + to_wall.
+        Phases: align -> look -> centre -> shift (slide to the wall, first
+                lane only) -> align -> observe -> cross, repeated per lane;
+                or look -> advance / finished.
         """
         if self.state_index != len(self.corridors) - 1 or self.gate_phase is not None:
             return False
@@ -1177,8 +1340,11 @@ class ObstacleCourseNode(Node):
                 # Never step past end_stop_gap from a wall ahead, so the next
                 # look ends the run instead of looping look -> blocked -> look.
                 free = self.nose_gap(points_now)
+                # At least 4 cm: a step of under 2 cm counts as "arrived" at
+                # once, so the robot looped look -> advance -> look forever just
+                # outside end_stop_gap.
                 self.advance_to = progress + min(self.advance_step,
-                                                 free - self.end_stop_gap + 0.01)
+                                                 max(0.04, free - self.end_stop_gap + 0.01))
                 self.set_dyn_phase('advance', now, "Nothing moving ahead: advancing")
 
         elif phase == 'advance':
@@ -1197,87 +1363,23 @@ class ObstacleCourseNode(Node):
                 self.move_2D(min(self.navigation_speed, 1.5 * remaining + 0.05), 0, turn)
 
         elif phase == 'centre':
-            # Get to the wall like a car: turn right, drive, turn back. That
-            # needs the turning circle to fit in the pocket between what is
-            # behind us and the lane ahead; otherwise slide sideways.
+            # Move along the corridor until the nose is lane_nose_gap from the
+            # lane (never backing into the lane behind), then slide to the wall.
             face = self.lane['s'] - self.lane['thick']
-            if self.at_wall:
-                # Already beside the wall (we cross straight along it): no need
-                # to turn to it again. Only back up if the nose is too close to
-                # this lane's sweep, then wait and cross.
-                rear_gap = progress - self.BODY_REAR - self.behind_s
-                gap = getattr(self, 'lane_nose_gap', -1.0)
-                if gap >= 0:
-                    # Move along the wall until the nose is `gap` from the lane.
-                    target = max(face - gap - self.BODY_FRONT,
-                                 self.behind_s + self.BODY_REAR + 0.02)
-                    error = target - progress
-                    if abs(error) > 0.015 and now - self.dyn_since < 8.0:
-                        self.move_2D(self.creep_speed(error), 0, turn)
-                    else:
-                        self.set_dyn_phase('align', now,
-                                           f"Waiting {face - progress - self.BODY_FRONT:.2f} m from the lane")
-                    return True
-                if face - (progress + self.BODY_FRONT) >= 0.08 or rear_gap < 0.05:
-                    self.set_dyn_phase('align', now)
-                else:
-                    self.move_2D(-0.1, 0, turn)
-                return True
-            depth = face - self.behind_s
-            self.car_style = (not getattr(self, 'use_strafe', False) and
-                              depth >= 2 * self.TURN_RADIUS + 0.06)
-            gap = getattr(self, 'lane_nose_gap', -1.0)
-            if self.car_style:  # rear axle (turning point) mid-pocket
-                target = 0.5 * (self.behind_s + face)
-            elif gap >= 0:      # nose `gap` from the lane, then slide
-                target = max(face - gap - self.BODY_FRONT,
-                             self.behind_s + self.BODY_REAR + 0.02)
-            else:               # body mid-pocket, for the sideways slide
-                target = 0.5 * (self.behind_s + face) - 0.5 * (self.BODY_FRONT - self.BODY_REAR)
+            target = max(face - self.lane_nose_gap - self.BODY_FRONT,
+                         self.behind_s + self.BODY_REAR + 0.02)
             error = target - progress
-            if abs(error) > 0.02 and now - self.dyn_since < 8.0:
+            if abs(error) > 0.015 and now - self.dyn_since < 8.0:
                 self.move_2D(self.creep_speed(error), 0, turn)
-            elif self.car_style:
-                self.set_dyn_phase('turn_right', now)
-            else:
-                self.set_dyn_phase('shift', now,
-                                   "Sliding sideways to the right wall (use_strafe)"
-                                   if getattr(self, 'use_strafe', False) else
-                                   f"Pocket {depth:.2f} m too shallow to turn: sliding sideways")
-
-        elif phase == 'turn_right':
-            right = np.array([forward[1], -forward[0]])
-            error = self.heading_error_to(right)
-            if abs(error) > math.radians(4):
-                self.move_2D(0, 0, self.Kp_theta * error)
-            else:
-                self.set_dyn_phase('to_wall', now)
-
-        elif phase == 'to_wall':
-            # Drive at the wall until the rear axle is just far enough from it
-            # to turn back (nose ~5 cm from the wall).
-            right = np.array([forward[1], -forward[0]])
-            gap = self.nose_gap(points_now)
-            stop_gap = (self.wall_nose_gap if getattr(self, 'wall_nose_gap', -1.0) >= 0
-                        else self.TURN_RADIUS + 0.03 - self.BODY_FRONT)
-            if gap > stop_gap and now - self.dyn_since < 12.0:
-                self.move_2D(min(self.navigation_speed, 1.5 * (gap - stop_gap) + 0.03), 0,
-                             self.Kp_theta * self.heading_error_to(right))
-            elif gap <= stop_gap + 0.05:
-                self.move_2D()
-                self.at_wall = True
+            elif self.at_wall:
                 self.set_dyn_phase('align', now,
-                                   f"At the right wall (nose {gap:.2f} m away); turning back")
+                                   f"Waiting {face - progress - self.BODY_FRONT:.2f} m from the lane")
             else:
-                self.move_2D()
-                self.lane = None
-                self.set_dyn_phase('align', now,
-                                   f"Could not reach the right wall ({gap:.2f} m); retrying")
+                self.set_dyn_phase('shift', now, "Sliding sideways to the right wall")
 
         elif phase == 'shift':
             # Hug the right wall: obstacles turn round there, so right after one
             # leaves our path it has its whole trip out and back to go.
-            # Slide sideways (mecanum) so we never move toward the lane.
             clearance = self.right_clearance(points_now)
             if clearance > self.wall_hug_gap + 0.02 and now - self.dyn_since < 15.0:
                 speed = min(self.strafe_speed, 1.5 * (clearance - self.wall_hug_gap) + 0.03)
@@ -1285,7 +1387,9 @@ class ObstacleCourseNode(Node):
             elif clearance < 0.25:
                 self.move_2D()
                 self.at_wall = True
-                self.set_dyn_phase('align', now, f"Hugging right wall ({clearance:.2f} m gap)")
+                # Back to 'centre': the slide drifts a few cm along the
+                # corridor, so line the nose up with the lane again.
+                self.set_dyn_phase('centre', now, f"Hugging right wall ({clearance:.2f} m gap)")
             else:
                 # Without the wall the "just left our path" rule is not safe:
                 # stop and try the look + slide again rather than cross.
@@ -1315,6 +1419,12 @@ class ObstacleCourseNode(Node):
                         (p[:, 1] > left_edge) & (p[:, 1] < 2.0))
                 edge = float(np.min(p[band, 1])) if np.any(band) else float('inf')
                 lane.setdefault('edges', deque(maxlen=30)).append((now, edge))
+                # Nearest edge INCLUDING the part in our path (not the right wall).
+                whole = ((p[:, 0] > face - progress - 0.05) & (p[:, 0] < strip_end) &
+                         (p[:, 1] > -(self.BODY_HALF_WIDTH + 0.03)) & (p[:, 1] < 2.0))
+                near = float(np.min(p[whole, 1])) if np.any(whole) else float('inf')
+                lane.setdefault('nears', deque(maxlen=80)).append((now, near))
+                self.track_swing(lane)
                 if self.strip_blocked(p, strip_end):
                     lane['blocked_since'] = lane.get('blocked_since') or now
                     # In our path for a while, not one flicker of its edge.
@@ -1337,24 +1447,57 @@ class ObstacleCourseNode(Node):
             gap = edge_now - left_edge
             clear_for = now - lane['clear_since'] if lane['clear_since'] is not None else 0.0
             just_left = lane['was_blocked'] and clear_for >= clear_hold and away
-            # Never reaches the wall: go when it heads away and is far enough off.
+            # Never reaches the wall: go when it heads away and is far enough off,
+            # but only just after it turned back from its nearest point. Near
+            # the far end of its swing it is about to come back.
+            closest = min((e for _, e in edges if math.isfinite(e)), default=float('inf'))
             going_away = (not lane['was_blocked'] and clear_for >= clear_hold and away and
                           math.isfinite(edge_now) and
-                          gap >= getattr(self, 'lane_clear_gap', 0.15))
+                          gap >= getattr(self, 'lane_clear_gap', 0.15) and
+                          edge_now <= closest + 0.15)
             never_came = (not lane['was_blocked'] and math.isinf(edge_now) and
                           clear_for > 12.0)
+            # Leaving: moving away fast enough to be clear of our path by the
+            # time the nose reaches the lane. Starts the crossing ~0.4 s sooner
+            # than waiting for "left our path" - fast swings return quickly.
+            nears = lane.get('nears', [])
+            past = [(t, e) for t, e in nears if 0.15 <= now - t <= 0.4 and math.isfinite(e)]
+            last3 = [e for _, e in list(nears)[-3:]]
+            # Steady motion over the last 3 scans, not one flicker of its edge.
+            steady = (len(last3) == 3 and all(map(math.isfinite, last3)) and
+                      last3[1] > last3[0] + 0.01 and last3[2] > last3[1] + 0.01)
+            leaving = False
+            if steady and past:
+                t0, e0 = past[-1]
+                speed = (nears[-1][1] - e0) / max(now - t0, 1e-3)
+                reach = getattr(self, 'lane_reach_time', 0.35)
+                leaving = (speed > 0.15 and nears[-1][1] < left_edge + 0.3 and
+                           nears[-1][1] + speed * reach >= left_edge + 0.02)
             if now - getattr(self, 'last_observe_log', 0.0) > 1.0:
                 self.last_observe_log = now
                 self.get_logger().info(
                     f"Watching lane {self.lanes_crossed + 1}: in my path={lane['clear_since'] is None}, "
                     f"seen in path={lane['was_blocked']}, obstacle edge "
                     f"{gap if math.isfinite(gap) else float('nan'):.2f} m left of my path, "
-                    f"moving away={away}, nose "
+                    f"moving away={away}, swing turns seen={len(lane.get('turns', []))}"
+                    + (f" (period {np.median(np.diff([t for t, _ in lane['turns'][-4:]])):.1f} s)"
+                       if len(lane.get('turns', [])) >= 2 else "")
+                    + ", nose "
                     f"{face - progress - self.BODY_FRONT:.2f} m from the lane")
-            if just_left or going_away or never_came:
+            turned_back = self.swing_turned_back(lane, now, left_edge)
+            # Learn the swing first: until two turnarounds are seen (or after
+            # swing_learn_time s), only the turnaround rule may start a crossing.
+            # The older rules start ~0.25 s later, too late for fast swings.
+            learning = (len(lane.get('turns', [])) < 2 and
+                        now - self.dyn_since < getattr(self, 'swing_learn_time', 6.0))
+            if learning:
+                just_left = going_away = leaving = False
+            if just_left or going_away or never_came or leaving or turned_back:
                 # Drive until the rear is cross_clear past the obstacle's far face.
                 self.cross_to = far_face + self.BODY_REAR + getattr(self, 'cross_clear', 0.15)
-                why = ("obstacle left our path and is moving away" if just_left else
+                why = ("obstacle just turned back and will be clear when we reach it" if turned_back else
+                       "obstacle is leaving and will be clear when we reach it" if leaving else
+                       "obstacle left our path and is moving away" if just_left else
                        f"obstacle moving away, {gap:.2f} m clear" if going_away else
                        "nothing seen for 12 s")
                 self.set_dyn_phase('cross', now, f"Crossing: {why}")
@@ -1371,7 +1514,7 @@ class ObstacleCourseNode(Node):
             front = progress + self.BODY_FRONT
             far_face = self.lane['s'] + self.lane['thick']
             if (front > far_face + 0.02 and
-                    self.nose_gap(points_now) < max(getattr(self, 'lane_nose_gap', -1.0), 0.05)):
+                    self.nose_gap(points_now) < max(getattr(self, 'lane_nose_gap', 0.07), 0.05)):
                 # Nose is through this lane and something (the next lane's
                 # obstacle, a box) is right in front: stop here rather than
                 # drive into it. This counts as crossed; the next look finds it.
@@ -1398,6 +1541,42 @@ class ObstacleCourseNode(Node):
                 self.move_2D(min(self.cross_speed, 3.0 * remaining + 0.03), 0, turn)
         return True
 
+    def step_gate_lineup(self, frame, goal):
+        '''Close to the line-up point: turn to face straight through the gate,
+        then slide (strafe + forward/back) onto the point without turning toward
+        it. Returns False to leave it to the normal planner (too far, or the
+        straight slide is blocked).'''
+        offset = frame.rotation.T @ (goal - self.pose[:2])  # robot frame
+        distance = float(np.linalg.norm(offset))
+        if distance > self.gate_strafe_range or not self.path_is_clear(
+                frame.points_now, offset, self.clearance_margin):
+            return False
+        heading_error = self.heading_error_to(self.gate['normal'])
+        turn = float(np.clip(self.Kp_theta * heading_error, -0.8, 0.8))
+        if abs(heading_error) > math.radians(2.0):
+            turn = math.copysign(max(abs(turn), 0.25), turn)  # real motors stall below this
+        else:
+            turn = 0.0
+        if distance < self.gate_arrive and abs(heading_error) < math.radians(self.gate_align_deg):
+            self.move_2D()
+            self.reset_target()
+            self.gate_phase = 'cross'
+            self.get_logger().info(
+                f"Gate: lined up by strafing ({distance * 100:.0f} cm, "
+                f"{math.degrees(heading_error):+.1f} deg), crossing")
+            return True
+        if abs(heading_error) > math.radians(15.0):  # face the gate first
+            self.log_stop('lineup_turn', f"Gate line-up: turning to face the gate "
+                          f"({math.degrees(heading_error):+.0f} deg off)")
+            self.move_2D(0, 0, turn)
+            return True
+        self.log_stop('lineup_slide', f"Gate line-up: sliding {offset[0]:+.2f} m forward, "
+                      f"{offset[1]:+.2f} m left onto the line-up point")
+        speed = min(self.strafe_speed, max(self.min_creep_speed, 1.2 * distance))
+        velocity = offset / max(distance, 1e-6) * speed
+        self.move_2D(float(velocity[0]), float(velocity[1]), turn)
+        return True
+
     def step_drive(self, frame):
         """Select a local free path, follow it, and replan if it stops working.
         Aims along the corridor, or at the gate waypoint during a gate phase."""
@@ -1406,6 +1585,8 @@ class ObstacleCourseNode(Node):
         self.rejected_targets = [(p, expiry) for p, expiry in self.rejected_targets
                                  if expiry > now]
         goal = self.gate_waypoint() if self.gate_phase is not None else None
+        if self.gate_phase == 'approach' and self.step_gate_lineup(frame, goal):
+            return
         if self.committed_target is None and goal is not None:
             # Go straight to the gate waypoint whenever that line is clear;
             # otherwise fall through to the gap planner, scored toward it.
@@ -1414,7 +1595,12 @@ class ObstacleCourseNode(Node):
                 margin, radius = self.gate_cross_check()
             else:
                 margin, radius = self.clearance_margin, None
-            if self.path_is_clear(points_now, goal_robot, margin, radius):
+            # Once lined up, ALWAYS commit to the gate: if the way through is
+            # blocked right now, the blocked check below waits (and lines up
+            # again after 8 s). Handing over to the gap planner here made the
+            # robot turn away from the gate it had just lined up on.
+            if (self.gate_phase == 'cross' or
+                    self.path_is_clear(points_now, goal_robot, margin, radius)):
                 self.committed_target = goal.copy()
                 self.target_length = float(np.linalg.norm(goal_robot))
                 self.get_logger().info(
@@ -1422,6 +1608,13 @@ class ObstacleCourseNode(Node):
         if self.committed_target is None:
             candidates = []
             travel = self.progress_direction
+            # Corridor 1 past turn_bias_after: favour paths toward the right-hand
+            # opening, so small openings between cans still win over straight on.
+            _, _, _, turn_side = self.corridor_axes()
+            travelled = (0.0 if self.state_start is None else
+                         float((self.pose[:2] - self.state_start) @ self.progress_direction))
+            turn_bias = (self.turn_bias_weight if self.state_index == 0 and goal is None
+                         and travelled > self.turn_bias_after else 0.0)
             if goal is not None:
                 to_goal = goal - self.pose[:2]
                 travel = to_goal / max(np.linalg.norm(to_goal), 1e-6)
@@ -1453,7 +1646,8 @@ class ObstacleCourseNode(Node):
                 score = (0.6 * gap['free_depth'] + 0.3 * np.cos(candidate_heading)
                          - self.reverse_penalty_weight * reverse
                          - 1.2 * visited - 0.5 * endpoint_visits
-                         + self.progress_bias_weight * maze_progress)
+                         + self.progress_bias_weight * maze_progress
+                         + turn_bias * max(0.0, float(offset @ turn_side)))
                 candidates.append((score, gap, target_world))
             # Score ALL directions together. Filtering to forward paths first
             # discarded fresh exits behind us, regardless of the visit penalty.
@@ -1527,7 +1721,29 @@ class ObstacleCourseNode(Node):
         else:
             self.blocked_since = None
         if at_gate_waypoint and self.gate_phase == 'cross':
-            # Something in the gate (e.g. a moving obstacle): wait, don't
+            # Commit: if what blocks the crossing is PAST the gate line (e.g. the
+            # first moving obstacle right behind the gate), the exit point can
+            # never be reached. Drive straight in until the nose is 7 cm from it
+            # and count the gate as crossed, instead of lining up again forever.
+            if blocked:
+                gate_along = float((rotation.T @ (self.gate['centre'] - self.pose[:2]))[0])
+                strip = (points_now[:, 0] > 0) & (np.abs(points_now[:, 1]) < self.gate_cross_radius)
+                block_x = float(np.min(points_now[strip, 0])) if np.any(strip) else float('inf')
+                if gate_along + 0.03 < block_x < float('inf'):
+                    nose_gap = block_x - self.BODY_FRONT
+                    if nose_gap > 0.07:
+                        self.log_stop('committing', f"Gate: committing, something {nose_gap:.2f} m past "
+                                      f"the nose beyond the gate line; driving in to 0.07 m")
+                        self.move_2D(min(self.navigation_speed, max(0.06, nose_gap - 0.07)), 0, 0)
+                        return
+                    self.move_2D()
+                    self.gate_phase = None
+                    self.get_logger().info(f"Gate: crossed (committed; stopped {nose_gap:.2f} m "
+                                           f"from something past the gate)")
+                    self.reset_target()
+                    self.enter_corridor(self.state_index + 1)
+                    return
+            # Something in the gate itself (e.g. a moving obstacle): wait, don't
             # abandon the crossing. After a long block, line up again.
             if blocked and now - self.blocked_since > 8.0:
                 self.get_logger().info("Gate: crossing blocked for 8 s, lining up again")
@@ -1565,11 +1781,33 @@ class ObstacleCourseNode(Node):
         heading_error = math.atan2(target_robot[1], target_robot[0])
         if abs(heading_error) > align_limit:
             vx = 0.0
+            step_away = self.turn_clearance_step(points_now)
+            if step_away is not None:
+                # Turning here would swing a corner into something: slide away first.
+                self.log_stop('stepping', "Too close to turn on the spot: sliding away first")
+                self.move_2D(step_away[0], step_away[1], 0.0)
+                return
             self.log_stop('turning', f"Stopped to turn on the spot: target "
                           f"{np.rad2deg(heading_error):.0f} deg off (align_angle_deg)")
         else:
             self.log_stop(None)
         self.move_2D(min(vx, self.navigation_speed, 0.8 * distance), 0, turn)
+
+    def turn_clearance_step(self, points_now):
+        """None if the body can turn on the spot here, else an (x, y) velocity
+        that slides it away from the nearest point. The body rotates about
+        turn_centre_x, so its corners sweep a circle of the radius below."""
+        if not len(points_now):
+            return None
+        cx = getattr(self, 'turn_centre_x', 0.0)
+        radius = math.hypot(max(self.BODY_FRONT - cx, self.BODY_REAR + cx), self.BODY_HALF_WIDTH)
+        rel = points_now - np.array([cx, 0.0])
+        dist = np.linalg.norm(rel, axis=1)
+        i = int(np.argmin(dist))
+        if dist[i] >= radius + getattr(self, 'turn_margin', 0.03):
+            return None
+        away = -rel[i] / max(dist[i], 1e-6)
+        return 0.08 * away
 
     def log_stop(self, reason, message=None):
         """Log why the robot stopped, once per stop (not every tick)."""
@@ -1624,7 +1862,8 @@ def main(args=None):
         pass
     finally:
         # Always publish a stop before releasing the controller's publisher.
-        obstacle.move_2D()
+        if rclpy.ok():
+            obstacle.move_2D()
         obstacle.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
